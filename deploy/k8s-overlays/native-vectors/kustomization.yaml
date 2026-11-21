@@ -1,0 +1,41 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: recall-relay
+resources:
+  - ../../k8s
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: recall-relay
+      spec:
+        template:
+          spec:
+            containers:
+              - name: relay
+                resources:
+                  requests:
+                    cpu: 500m
+                    memory: 768Mi
+                  limits:
+                    cpu: "2"
+                    memory: 2Gi
+                volumeMounts:
+                  - name: embedding-models
+                    mountPath: /var/lib/recall-models
+                    readOnly: true
+            volumes:
+              - name: embedding-models
+                persistentVolumeClaim:
+                  # 指向已装有权重的 PVC；其 blobs/ 目录中应有固定 SHA-256 对应的权重文件。
+                  claimName: recall-relay-embedding-models
+                  readOnly: true
+  - patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: recall-relay-config
+      data:
+        HISTORY_EMBEDDING_MODE: "replay"
+        HISTORY_EMBEDDING_MODEL_DIR: "/var/lib/recall-models"

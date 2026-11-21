@@ -1,10 +1,18 @@
 # RecallRelay · Rust 版
 
-客户端始终访问一个地址，默认是 `http://127.0.0.1:8000`。服务把请求发给你配置的上游。设置 `REDIS_URL` 后，同一个端口上的聊天请求自动获得故障回放能力。上游可使用 HTTP 或 HTTPS。需要向外提供 HTTPS 时，可由反向代理终止 TLS，再转给这个端口。
+RecallRelay 是聊天缓存中间件。每次先请求上游，正常就转发回答，并把符合条件的完整回答写入缓存。上游故障时才查缓存。普通聊天在缓存未命中时返回错误；只有符合条件的 ComfyUI 提示词优化请求才会回显用户原文。
+
+用 Compose 可直接启动 Relay、Redis 和 MySQL，默认入口为 `http://127.0.0.1:8000`。
+
+```sh
+sh deploy/compose/init-env.sh
+docker compose up -d --build --wait
+docker compose logs --tail 100 -f relay
+```
 
 ## 先跑通一个请求
 
-在本项目目录打开终端。第一次编译会下载 Cargo 依赖。下面用项目附带的模拟模型，示例令牌 `demo` 只用于这次本地练习。
+在本项目目录打开终端。本机编译需要 Rust、CMake、C++ 编译器和 libclang，第一次会下载 Cargo 依赖。用 Docker Compose 时，镜像内已经配置好编译工具。下面用项目附带的模拟模型，示例令牌 `demo` 只用于这次本地练习。
 
 **终端一** 启动模拟上游。它监听 8091，扮演部署时的模型服务。
 
@@ -34,6 +42,16 @@ curl -sS http://127.0.0.1:8000/v1/chat/completions \
 聊天客户端发送的都是 `POST /v1/chat/completions`。上面的请求省略了 `stream`，模拟服务一次返回完整 JSON。想看 SSE，在同一条命令的请求体中加上 `"stream":true`，将 curl 的 `-sS` 改为 `-NsS`，终端就会按收到的顺序打印 `data:` 事件。
 
 启用历史后的聊天处理器会检查 `User-Agent`。以 `ComfyUI-Sulphur-Prompt-Enhancer/` 开头的标识可识别 Sulphur 插件。提示词回显还要求是非流式、单回答的文本优化请求，并且前面的降级阶段均未得到结果。插件内部的语言和风格探针按其自己的规则处理。
+
+### 在容器日志里跟一次请求
+
+```sh
+docker compose logs --tail 100 -f relay
+```
+
+每次请求会得到一个 `request_id`。同一个 ID 下可以看到请求正文、上游主机与路径、返回状态和响应正文。JSON 直接预览，SSE 收到完整的行就输出；每个方向最多预览前 2048 字节，`omitted_bytes` 表示省略的字节数。长图片的 Base64 会缩略；图片排在提问前面时，聊天日志会另显示最多 256 字节的用户文字。二进制和压缩正文只记录长度。将 `RELAY_LOG_CONTENT=false` 写入环境文件并重建 Relay 容器，可以只看转发和降级过程。
+
+成功回答交付完毕后，`relay_cache queued=true` 表示已提交后台写入。主模型返回 503 时，`stage="primary"` 的失败行记录上游状态和原因，`relay_history` 显示历史查询结果；命中时最终响应包含 `fallback_source="history"`。
 
 ## 在相同地址验证故障回放
 
@@ -65,7 +83,7 @@ curl -si http://127.0.0.1:8000/v1/chat/completions \
 | 1 | [src/main.rs](src/main.rs) | 找到唯一的 `TcpListener::bind`。看 `.await` 如何等待服务，以及 `?` 如何将启动错误交回调用者。 |
 | 2 | [src/lib.rs](src/lib.rs) | 从 `dispatch` 读起。健康检查就地返回，启用历史的聊天请求交给聊天处理器，普通请求交给转发器。 |
 | 3 | [src/passthrough.rs](src/passthrough.rs) | 在 `forward` 里跟着一条请求看 method、原始路径、查询串、请求头和字节如何发往固定主机。 |
-| 4 | [src/relay/mod.rs](src/relay/mod.rs) | `handle` 负责排队和解析，`conversation` 决定先调用哪个模型、何时才能查历史。 |
+| 4 | [src/relay/mod.rs](src/relay/mod.rs) | `handle` 负责排队和解析，`conversation` 先请求上游，遇到可降级的故障才查缓存。 |
 | 5 | [src/history/identity.rs](src/history/identity.rs) 与 [src/history/mod.rs](src/history/mod.rs) | `canonicalize` 借用请求，生成用于查找记录的指纹。`enqueue` 把可保存的回答交给后台，`lookup` 负责故障时取回。 |
 | 6 | [src/relay/sse.rs](src/relay/sse.rs) 与 [src/delivery.rs](src/delivery.rs) | 观察上游分块、SSE 事件和下游写入之间的区别。一个事件可能横跨多个网络分块。 |
 
@@ -73,17 +91,15 @@ curl -si http://127.0.0.1:8000/v1/chat/completions \
 
 ## 聊天请求的处理顺序
 
-每次先尝试客户端指定的主模型。单个非空 `Authorization`、可确定身份的请求及通过校验的完整主模型回答，才具备历史读写条件。主模型鉴权失败会直接返回。如果主模型超时、限流、服务不可用或返回符合降级条件的空回答，Relay 在提交下游响应前依次尝试以下来源。
+每次先尝试客户端指定的主模型。单个非空 `Authorization`、可确定身份的请求及通过校验的完整上游回答，才具备历史读写条件。主模型鉴权失败会直接返回。如果主模型超时、限流、服务不可用或返回符合降级条件的空回答，Relay 在提交下游响应前依次尝试以下来源。
 
 | 来源 | 条件与行为 |
 | --- | --- |
 | 精确历史 | 先查 Redis，再查可选的 MySQL。回放前再次校验保存的 JSON 或 SSE。 |
-| 近似历史 | 单张内联图片可按相同范围和已识别的意图匹配。启用 Ollama 嵌入后改用有阈值的向量匹配。 |
-| 网关备用模型 | 配置 `FALLBACK_MODEL` 后，向同一网关换模型尝试一次。成功时响应头标记为 `model`。 |
-| 本机 CPU 模型 | 同时配置 `CPU_FALLBACK_URL` 和 `CPU_FALLBACK_MODEL` 后尝试本机服务。仅转发所需协议头与请求 ID，网关凭据留在网关一侧。成功时标记为 `cpu`。 |
+| 近似历史 | 单张内联图片可按相同范围和已识别的意图匹配。启用向量后，由 Rust 进程内的 EmbeddingGemma 生成提问向量，按配置阈值匹配。 |
 | Sulphur 提示词 | 对符合条件的 ComfyUI Sulphur 非流式优化请求，可返回本次请求中的用户提示词，标记为 `prompt`。其余请求返回相应的可重试错误。 |
 
-流式响应已经开始传输后，上游中断会终止当前响应。主模型正常返回、管理员关闭某个降级阶段或某个候选不符合条件时，会跳过后续或对应阶段。
+流式响应已经开始传输后，上游中断会终止当前响应。缓存未命中时，普通聊天返回错误。
 
 ## 常用配置
 
@@ -97,6 +113,8 @@ curl -si http://127.0.0.1:8000/v1/chat/completions \
 | `TOTAL_TIMEOUT_SECONDS`、`STREAM_TIMEOUT_SECONDS` | 默认请求总预算 60 秒。启用历史后，已经提交的聊天流有独立预算，默认 600 秒。非流式、SSE 启动和 Sulphur 的细分预算见 [src/config.rs](src/config.rs)。 |
 | `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` | 配置长期存储。Redis 热缓存默认保留 24 小时、最多 1024 条。MySQL 命中后会回填 Redis。 |
 | `HISTORY_NEAR_MODE`、`HISTORY_EMBEDDING_MODE` | 可选 `off`、`shadow` 或 `replay`。`shadow` 只观察近似命中。默认启用规则匹配，关闭嵌入。 |
+| `HISTORY_EMBEDDING_MODEL_PATH` | Rust 在进程内读取原有 `embeddinggemma:300m-qat-q8_0` 权重，可指定原始 GGUF 文件或挂载既有模型卷。启用向量时，服务启动前会校验权重并预热。 |
+| `RELAY_LOG_CONTENT` | 默认 `true`，在容器标准输出预览实际请求和响应。正文内的业务数据也会出现在预览中。 |
 | `RUST_LOG` | 例如 `recall_relay=debug` 可以查看降级阶段及命中计数。 |
 
 ## 验证与部署
@@ -109,4 +127,4 @@ cargo fmt --all -- --check
 
 有 `redis-server` 时测试会启动临时实例。若程序不在 PATH 下，可设置 `TEST_REDIS_BIN`。MySQL 集成用例需要独立的 MySQL 8.4 测试库，参数见 [src/archive.rs](src/archive.rs)。HTTP 集成用例启动本机临时端口，不需要真实模型或生产令牌。
 
-容器部署和本机 Ollama 的配置见 [Compose 说明](deploy/compose/README.md) 和 [Kubernetes 说明](deploy/k8s/README.md)。
+主 Compose 默认启动 Relay、Redis 和 MySQL。模型卷挂载和部署命令见 [Compose 说明](deploy/compose/README.md) 和 [Kubernetes 说明](deploy/k8s/README.md)。

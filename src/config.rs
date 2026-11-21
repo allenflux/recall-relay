@@ -204,7 +204,7 @@ impl Routes {
     }
 }
 
-/// 聊天故障回放需要为主模型、历史查询、备用模型和写回响应分别预留时间。
+/// 聊天请求先走主上游。故障时，在总时限里预留历史查询与写回响应的时间。
 /// Option<Duration> 对应 Python 中可为 None 的配置；没有覆盖值时使用通用预算。
 #[derive(Clone)]
 pub struct RelayConfig {
@@ -219,21 +219,12 @@ pub struct RelayConfig {
     pub max_ingest: usize,
     pub max_inflight: usize,
     pub retry_after: usize,
-    pub fallback_model: String,
-    pub fallback_model_timeout: Duration,
-    pub fallback_model_multimodal: bool,
-    pub cpu_fallback_url: String,
-    pub cpu_fallback_model: String,
-    pub cpu_fallback_timeout: Duration,
-    pub cpu_fallback_multimodal: bool,
-    pub cpu_max_inflight: usize,
     pub stream_timeout: Duration,
     pub max_pending: usize,
     pub queue_timeout: Duration,
     pub max_buffered_body: usize,
     pub nonstream_total_timeout: Option<Duration>,
     pub nonstream_upstream_timeout: Option<Duration>,
-    pub nonstream_fallback_model_timeout: Option<Duration>,
     pub reject_empty_json: bool,
     pub sse_startup_timeout: Option<Duration>,
     pub sse_upstream_timeout: Option<Duration>,
@@ -243,7 +234,6 @@ pub struct RelayConfig {
 
 impl RelayConfig {
     pub(crate) fn from_env(routes: &Routes, fallback_budget: Duration) -> Result<Self> {
-        let cpu_enabled = flag("CPU_FALLBACK_ENABLED", true)?;
         let config = Self {
             upstream_url: routes.chat_url.to_string(),
             policy: setting("POLICY_EPOCH", "v1"),
@@ -259,28 +249,9 @@ impl RelayConfig {
             max_pending: number("MAX_PENDING", 0)?,
             queue_timeout: time("QUEUE_TIMEOUT_SECONDS", 15)?,
             max_buffered_body: number("MAX_BUFFERED_BODY_BYTES", 64 * 1024 * 1024)?,
-            fallback_model: setting("FALLBACK_MODEL", ""),
-            fallback_model_multimodal: flag("FALLBACK_MODEL_MULTIMODAL", false)?,
-            fallback_model_timeout: time("FALLBACK_MODEL_TIMEOUT_SECONDS", 12)?,
-            cpu_fallback_url: if cpu_enabled {
-                setting("CPU_FALLBACK_URL", "")
-            } else {
-                String::new()
-            },
-            cpu_fallback_model: if cpu_enabled {
-                setting("CPU_FALLBACK_MODEL", "")
-            } else {
-                String::new()
-            },
-            cpu_max_inflight: number("CPU_FALLBACK_MAX_INFLIGHT", 1)?,
-            cpu_fallback_timeout: time("CPU_FALLBACK_TIMEOUT_SECONDS", 18)?,
-            cpu_fallback_multimodal: flag("CPU_FALLBACK_MULTIMODAL", false)?,
             stream_timeout: time("STREAM_TIMEOUT_SECONDS", 600)?,
             nonstream_total_timeout: optional_time("NONSTREAM_TOTAL_TIMEOUT_SECONDS")?,
             nonstream_upstream_timeout: optional_time("NONSTREAM_UPSTREAM_TIMEOUT_SECONDS")?,
-            nonstream_fallback_model_timeout: optional_time(
-                "NONSTREAM_FALLBACK_MODEL_TIMEOUT_SECONDS",
-            )?,
             reject_empty_json: flag("REJECT_EMPTY_JSON_COMPLETIONS", false)?,
             sse_startup_timeout: optional_time("SSE_STARTUP_TIMEOUT_SECONDS")?,
             sse_upstream_timeout: optional_time("SSE_UPSTREAM_TIMEOUT_SECONDS")?,
@@ -295,29 +266,24 @@ impl RelayConfig {
         Ok(config)
     }
 
-    pub fn timeouts(&self, streaming: bool, sulphur: bool) -> (Duration, Duration, Duration) {
+    pub fn timeouts(&self, streaming: bool, sulphur: bool) -> (Duration, Duration) {
         if streaming {
             return (
                 self.sse_startup_timeout.unwrap_or(self.total_timeout),
                 self.sse_upstream_timeout.unwrap_or(self.upstream_timeout),
-                self.fallback_model_timeout,
             );
         }
         let total = self.nonstream_total_timeout.unwrap_or(self.total_timeout);
         let primary = self
             .nonstream_upstream_timeout
             .unwrap_or(self.upstream_timeout);
-        let alternate = self
-            .nonstream_fallback_model_timeout
-            .unwrap_or(self.fallback_model_timeout);
         if sulphur {
             (
                 self.sulphur_nonstream_total_timeout.unwrap_or(total),
                 self.sulphur_nonstream_upstream_timeout.unwrap_or(primary),
-                alternate,
             )
         } else {
-            (total, primary, alternate)
+            (total, primary)
         }
     }
 
@@ -335,7 +301,6 @@ impl RelayConfig {
         let max_permits = tokio::sync::Semaphore::MAX_PERMITS;
         ensure!(
             (1..=max_permits).contains(&self.max_inflight)
-                && (1..=max_permits).contains(&self.cpu_max_inflight)
                 && self.max_pending <= max_permits
                 && self.max_body > 0
                 && self.max_buffered_body >= self.max_body,
@@ -351,32 +316,6 @@ impl RelayConfig {
                 && self.queue_timeout <= minute,
             "总预算、流式或排队超时无效"
         );
-        ensure!(
-            self.cpu_fallback_url.is_empty() == self.cpu_fallback_model.is_empty(),
-            "CPU_FALLBACK_URL 和 CPU_FALLBACK_MODEL 应同时配置"
-        );
-        if !self.cpu_fallback_url.is_empty() {
-            let cpu = http_url(&self.cpu_fallback_url, "CPU_FALLBACK_URL")?;
-            fn loopback(url: &Url) -> bool {
-                url.host_str().is_some_and(|s| {
-                    s.trim_matches(['[', ']'])
-                        .parse::<IpAddr>()
-                        .is_ok_and(|ip| ip.is_loopback())
-                })
-            }
-            let same_listener = (loopback(&ingress) || ingress.host_str() == Some("localhost"))
-                && ingress.scheme() == cpu.scheme()
-                && ingress.port_or_known_default() == cpu.port_or_known_default();
-            ensure!(
-                loopback(&cpu)
-                    && cpu.path() != "/"
-                    && cpu.query().is_none()
-                    && cpu.fragment().is_none()
-                    && cpu != upstream
-                    && !same_listener,
-                "CPU 备用端点必须使用独立的回环 IP 和补全路径"
-            );
-        }
         for (streaming, sulphur) in [(true, false), (false, false), (false, true)] {
             let custom_sulphur = sulphur
                 && (self.sulphur_nonstream_total_timeout.is_some()
@@ -388,7 +327,7 @@ impl RelayConfig {
             } else {
                 ceiling
             };
-            let (total, primary, alternate) = self.timeouts(streaming, sulphur);
+            let (total, primary) = self.timeouts(streaming, sulphur);
             ensure!(
                 total >= minimum
                     && total <= limit
@@ -397,17 +336,6 @@ impl RelayConfig {
                     && primary.saturating_add(self.fallback_budget) < total,
                 "需要在总时限内为上游、历史回放与响应预留时间"
             );
-            let mut reserve = self.fallback_budget + Duration::from_millis(20);
-            for (model, budget) in [
-                (&self.fallback_model, alternate),
-                (&self.cpu_fallback_model, self.cpu_fallback_timeout),
-            ] {
-                if !model.is_empty() {
-                    ensure!(!budget.is_zero(), "备用模型超时须大于零");
-                    reserve = reserve.saturating_add(budget);
-                    ensure!(reserve < total, "备用模型和历史查询的预算之和过大");
-                }
-            }
         }
         Ok(())
     }

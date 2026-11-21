@@ -211,85 +211,8 @@ async fn local_redis_exact_near_shadow_and_backfill() -> Result<()> {
         (None, "validation_reject")
     );
     verified.close().await;
-    verify_vector_replay(&url).await?;
     history.close().await;
     shadow.close().await;
-    Ok(())
-}
-
-/// 用只返回固定向量的 HTTP 服务验证 Ollama 协议和 Redis 向量格式，全程使用本机数据。
-#[cfg(unix)]
-async fn verify_vector_replay(redis_url: &str) -> Result<()> {
-    use axum::{Json, Router, routing::post};
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let url = format!("http://{}/api/embed", listener.local_addr()?);
-    let endpoint = Router::new().route(
-        "/api/embed",
-        post(|Json(payload): Json<Value>| async move {
-            assert_eq!(payload["dimensions"], embedding::DIMENSIONS);
-            assert_eq!(payload["options"]["num_gpu"], 0);
-            assert!(
-                payload["input"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("task: sentence similarity | query: ")
-            );
-            let mut vector = vec![0.0; embedding::DIMENSIONS];
-            vector[0] = 1.0;
-            Json(json!({"embeddings":[vector]}))
-        }),
-    );
-    let mock = tokio::spawn(async move {
-        axum::serve(listener, endpoint).await.unwrap();
-    });
-    let vectors = Vectors {
-        mode: Mode::Replay,
-        embedder: Embedder::new(&url, "embeddinggemma:test".to_owned(), true)?,
-        threshold: 0.90,
-        last_resort: Some(0.85),
-        timeout: Duration::from_millis(650),
-    };
-    let history = History::start(Storage {
-        hot: Hot::new(redis_url, "vector-fixture")?,
-        archive: None,
-        near_mode: Mode::Replay,
-        vectors: Some(vectors),
-        verifier: None,
-    });
-    let identity = |p: &str| canonicalize("t", "v", &image_request(p)).unwrap();
-    let original = identity("What is in this image?");
-    let alternate = identity("Please describe the image.");
-    assert!(history.enqueue(&original, b"answer".to_vec()));
-    let key = format!("vector-fixture:record:{}:vector", original.exact);
-    timeout(Duration::from_secs(3), async {
-        while history
-            .storage
-            .hot
-            .query::<Option<Vec<u8>>>(redis::cmd("GET").arg(&key))
-            .await
-            .unwrap()
-            .is_none()
-        {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await?;
-    let answer = |b: &[u8]| Some(b.to_vec());
-    assert_eq!(
-        history.lookup(Some(&alternate), answer).await,
-        (Some(b"answer".to_vec()), "vector_near")
-    );
-    assert_eq!(
-        history
-            .lookup(Some(&identity("Read only the letters.")), answer)
-            .await,
-        (None, "miss")
-    );
-    history.close().await;
-    mock.abort();
-    let _ = mock.await;
     Ok(())
 }
 

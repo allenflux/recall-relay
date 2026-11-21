@@ -33,23 +33,33 @@ impl Drop for ChildGuard {
 }
 
 fn start_relay(settings: &[(&str, &str)]) -> (ChildGuard, SocketAddr) {
+    start_relay_with_stdout(settings, Stdio::null())
+}
+
+fn start_relay_with_stdout(settings: &[(&str, &str)], stdout: Stdio) -> (ChildGuard, SocketAddr) {
     let child = Command::new(env!("CARGO_BIN_EXE_recall-relay"))
         .env_clear()
         .env("RELAY_BIND", "127.0.0.1:0")
         .env("INGRESS_ORIGIN", "http://127.0.0.1:8000")
         .envs(settings.iter().copied())
+        .stdout(stdout)
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let mut guard = ChildGuard(child);
     let mut lines = BufReader::new(guard.0.stderr.take().unwrap()).lines();
-    let first = lines.next().expect("服务在启动前退出").unwrap();
-    let addr = first
-        .split_whitespace()
-        .last()
-        .unwrap()
-        .parse()
-        .unwrap_or_else(|_| panic!("服务未监听：{first}"));
+    // llama.cpp 探测本机 CPU / GPU 时可以先写诊断日志，端口只取应用自己的就绪行。
+    let mut last = String::new();
+    let addr = loop {
+        let line = lines
+            .next()
+            .unwrap_or_else(|| panic!("服务启动失败，最后日志：{last}"))
+            .unwrap();
+        if let Some(address) = line.strip_prefix("RecallRelay 已启动，监听 ") {
+            break address.parse().expect("监听地址");
+        }
+        last = line;
+    };
     std::thread::spawn(move || for _ in lines {});
     (guard, addr)
 }
@@ -214,7 +224,7 @@ async fn complete(State(model): State<Arc<Model>>, req: Request) -> Response {
 }
 
 #[tokio::test]
-async fn history_tries_primary_then_gateway_when_storage_is_unavailable() {
+async fn history_returns_the_upstream_failure_when_storage_is_unavailable() {
     let model = Arc::new(Model::default());
     let upstream = serve(
         Router::new()
@@ -230,7 +240,6 @@ async fn history_tries_primary_then_gateway_when_storage_is_unavailable() {
         ),
         ("POLICY_EPOCH", "test"),
         ("REDIS_URL", "redis://127.0.0.1:1"),
-        ("FALLBACK_MODEL", "backup"),
         ("MAX_INFLIGHT", "1"),
     ]);
     let url = format!("http://{addr}/v1/chat/completions");
@@ -242,11 +251,11 @@ async fn history_tries_primary_then_gateway_when_storage_is_unavailable() {
     assert!(live.headers().get("x-failover-source").is_none());
     assert_eq!(live.json::<Value>().await.unwrap()["model"], "primary");
     model.offline.store(true, Ordering::Relaxed);
-    let backup = send().await.unwrap();
-    assert_eq!(backup.status(), 200);
-    assert_eq!(backup.headers()["x-failover-source"], "model");
-    assert_eq!(backup.json::<Value>().await.unwrap()["model"], "backup");
-    assert_eq!(model.calls.load(Ordering::Relaxed), 3);
+    let failure = send().await.unwrap();
+    assert_eq!(failure.status(), 503);
+    assert!(failure.headers().get("x-failover-source").is_none());
+    assert!(failure.bytes().await.unwrap().is_empty());
+    assert_eq!(model.calls.load(Ordering::Relaxed), 2);
 
     // 在同一进程、同一端口检查通用转发、健康检查与模型列表。
     let simple = client
@@ -287,6 +296,112 @@ async fn history_tries_primary_then_gateway_when_storage_is_unavailable() {
         .unwrap();
     assert_eq!(health.text().await.unwrap(), "ok");
     drop(slow);
+}
+
+#[tokio::test]
+async fn completed_json_and_sse_log_the_cache_queue_with_request_id() {
+    let upstream = serve(Router::new().fallback(|axum::Json(req): axum::Json<Value>| async move {
+        if req["stream"] == true {
+            ([(header::CONTENT_TYPE, "text/event-stream")],
+             "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").into_response()
+        } else {
+            axum::Json(json!({"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]})).into_response()
+        }
+    })).await;
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let (_relay, addr) = start_relay_with_stdout(
+        &[
+            (
+                "UPSTREAM_URL",
+                &format!("http://{upstream}/v1/chat/completions"),
+            ),
+            ("REDIS_URL", "redis://127.0.0.1:1"),
+            ("RELAY_LOG_CONTENT", "false"),
+        ],
+        log.reopen().unwrap().into(),
+    );
+    for streaming in [false, true] {
+        let response = client().post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth("test")
+            .json(&json!({"model":"m","messages":[{"role":"user","content":"query"}],"stream":streaming}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let _body = response.bytes().await.unwrap();
+    }
+    let logs = std::fs::read_to_string(log.path()).unwrap();
+    for streaming in [false, true] {
+        let line = logs
+            .lines()
+            .find(|line| {
+                line.contains("relay_cache") && line.contains(&format!("streaming={streaming}"))
+            })
+            .unwrap();
+        assert!(line.contains("queued=true"));
+        let (_, id) = line.split_once("request_id=").unwrap();
+        let id = id.split('}').next().unwrap();
+        assert!(logs.lines().any(|l| l.contains(id)
+            && l.contains("relay_stage")
+            && l.contains("event=\"attempt\"")));
+    }
+}
+
+/// 老部署可能还保留备用模型配置。命不中缓存时，保留主模型的限流响应，原请求只发一次。
+#[tokio::test]
+async fn legacy_model_settings_cannot_trigger_a_second_upstream_call() {
+    let gateway_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let calls = Arc::clone(&gateway_calls);
+    let gateway = serve(Router::new().fallback(move |req: Request| {
+        let calls = Arc::clone(&calls);
+        async move {
+            let raw = to_bytes(req.into_body(), 8192).await.unwrap();
+            let payload: Value = serde_json::from_slice(&raw).unwrap();
+            calls
+                .lock()
+                .unwrap()
+                .push(payload["model"].as_str().unwrap().to_owned());
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, "23")],
+                "model overloaded",
+            )
+        }
+    }))
+    .await;
+    let legacy_calls = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::clone(&legacy_calls);
+    let legacy = serve(Router::new().fallback(move || {
+        calls.fetch_add(1, Ordering::Relaxed);
+        async { StatusCode::SERVICE_UNAVAILABLE }
+    }))
+    .await;
+    let (_relay, addr) = start_relay(&[
+        (
+            "UPSTREAM_URL",
+            &format!("http://{gateway}/v1/chat/completions"),
+        ),
+        ("REDIS_URL", "redis://127.0.0.1:1"),
+        ("FALLBACK_MODEL", "gateway-backup"),
+        ("CPU_FALLBACK_ENABLED", "true"),
+        (
+            "CPU_FALLBACK_URL",
+            &format!("http://{legacy}/v1/chat/completions"),
+        ),
+        ("CPU_FALLBACK_MODEL", "unused-cpu"),
+    ]);
+    let request = json!({"model":"primary","messages":[{"role":"user","content":"你好"}]});
+    let reply = client()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .bearer_auth("test")
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 429);
+    assert!(reply.headers().get("x-failover-source").is_none());
+    assert_eq!(reply.headers()[header::RETRY_AFTER], "23");
+    assert_eq!(reply.text().await.unwrap(), "model overloaded");
+    assert_eq!(*gateway_calls.lock().unwrap(), ["primary"]);
+    assert_eq!(legacy_calls.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -331,4 +446,271 @@ async fn sulphur_fallback_requires_plugin_header_and_nonstream_request() {
         .unwrap();
     assert_eq!(sse.status(), 503);
     assert!(sse.headers().get("x-failover-source").is_none());
+}
+
+/// 先把 Python 客户端生成的 Redis 正文、向量和索引装进隔离库，再让主模型对新问题返回 503。
+/// 两个问题标点不同，没有新问题的精确记录；只有原生向量命中旧记录才能返回这段回答。
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "需要本机官方 GGUF 和 redis-server"]
+async fn native_replays_legacy_ollama_record_after_503() -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use std::env;
+
+    let fixture: Value = serde_json::from_str(include_str!("fixtures/embeddinggemma-ollama.json"))?;
+    let legacy = &fixture["legacy_record"];
+    let dir = tempfile::Builder::new().prefix("rr-legacy-").tempdir()?;
+    let socket = dir.path().join("redis.sock");
+    let redis_bin = env::var("TEST_REDIS_BIN").unwrap_or_else(|_| "redis-server".into());
+    let redis = Command::new(redis_bin)
+        .args(["--port", "0", "--unixsocket"])
+        .arg(&socket)
+        .args(["--save", "", "--appendonly", "no"])
+        .current_dir(dir.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("无法启动测试 Redis，可设置 TEST_REDIS_BIN")?;
+    let mut redis_process = ChildGuard(redis);
+    let redis_url = format!("redis+unix://{}", socket.display());
+    let database = redis::Client::open(redis_url.as_str())?;
+    let mut db = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(conn) = database.get_multiplexed_async_connection().await {
+                return anyhow::Ok(conn);
+            }
+            ensure!(redis_process.0.try_wait()?.is_none(), "隔离 Redis 启动失败");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let exact = legacy["exact"].as_str().unwrap();
+    let scope = legacy["scope"].as_str().unwrap();
+    let key = format!("gguf-test:record:{exact}");
+    let record = STANDARD.decode(legacy["record_base64"].as_str().unwrap())?;
+    let case = fixture["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["label"] == legacy["vector_case"])
+        .unwrap();
+    let mut blob = hex::decode(legacy["marker_hex"].as_str().unwrap())?;
+    blob.extend(STANDARD.decode(case["vector_f32_be"].as_str().unwrap())?);
+    redis::pipe()
+        .atomic()
+        .set_ex(&key, &record, 180)
+        .ignore()
+        .set_ex(format!("{key}:vector"), blob, 180)
+        .ignore()
+        .zadd(
+            "gguf-test:verified",
+            format!("vector-v1:{scope}:{exact}"),
+            0,
+        )
+        .ignore()
+        .query_async::<()>(&mut db)
+        .await?;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let upstream = serve(Router::new().fallback(move || {
+        counter.fetch_add(1, Ordering::Relaxed);
+        async { StatusCode::SERVICE_UNAVAILABLE }
+    }))
+    .await;
+    let upstream_url = format!("http://{upstream}/v1/chat/completions");
+    let explicit = env::var("HISTORY_EMBEDDING_MODEL_PATH").unwrap_or_default();
+    let models = env::var("HISTORY_EMBEDDING_MODEL_DIR")
+        .or_else(|_| env::var("OLLAMA_MODELS"))
+        .unwrap_or_default();
+    let mut settings = vec![
+        ("UPSTREAM_URL", upstream_url.as_str()),
+        ("REDIS_URL", redis_url.as_str()),
+        ("REDIS_PREFIX", "gguf-test"),
+        ("POLICY_EPOCH", legacy["policy"].as_str().unwrap()),
+        ("HISTORY_EMBEDDING_MODE", "replay"),
+        ("HISTORY_EMBEDDING_TIMEOUT_SECONDS", "3"),
+    ];
+    if !explicit.is_empty() {
+        settings.push(("HISTORY_EMBEDDING_MODEL_PATH", &explicit));
+    }
+    if !models.is_empty() {
+        settings.push(("HISTORY_EMBEDDING_MODEL_DIR", &models));
+    }
+    let (_relay, addr) = start_relay(&settings);
+    let client = client();
+    let url = format!("http://{addr}/v1/chat/completions");
+    // 应用在就绪前已完成预热，第一笔实际故障就应成功回放。
+    let response = client
+        .post(&url)
+        .bearer_auth("compat-fixture")
+        .header(header::ACCEPT, "application/json")
+        .json(&legacy["request"])
+        .send()
+        .await?;
+    ensure!(calls.load(Ordering::Relaxed) == 1, "应先请求主模型一次");
+    ensure!(
+        response.status() == 200,
+        "向量回放失败，状态 {}",
+        response.status()
+    );
+    ensure!(
+        response.headers()["x-failover-source"] == "history",
+        "回答并非历史命中"
+    );
+    let body = response.bytes().await?;
+    let split = record
+        .iter()
+        .position(|&b| b == b'\n')
+        .context("历史记录缺少分隔符")?;
+    ensure!(
+        body.as_ref() == &record[split + 1..],
+        "返回的正文与旧记录不同"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn logs_preview_both_directions_and_stream_before_eof() {
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let upstream = serve(Router::new().fallback({
+        let finish = finish.clone();
+        move || {
+            let finish = finish.clone();
+            async move {
+                let stream = async_stream::stream! {
+                    yield Ok::<_, std::io::Error>(Bytes::from_static("data: 你好\n\n".as_bytes()));
+                    finish.notified().await;
+                    yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+                };
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(stream),
+                )
+            }
+        }
+    }))
+    .await;
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let (_relay, addr) = start_relay_with_stdout(
+        &[("UPSTREAM_ORIGIN", &format!("http://{upstream}"))],
+        log.reopen().unwrap().into(),
+    );
+    let text = format!("用户提问{}超出预览的尾部", "中".repeat(750));
+    let mut answer = client()
+        .post(format!("http://{addr}/chat?token=hidden-query"))
+        .bearer_auth("hidden-authorization")
+        .body(text.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.chunk().await.unwrap().unwrap(), "data: 你好\n\n");
+    let first = std::fs::read_to_string(log.path()).unwrap();
+    for expected in [
+        "用户提问",
+        "data: 你好",
+        "stage=\"passthrough\"",
+        "request_id=",
+        "omitted_bytes=",
+    ] {
+        assert!(first.contains(expected), "缺少日志字段 {expected}: {first}");
+    }
+    for secret in [
+        "超出预览的尾部",
+        "hidden-query",
+        "hidden-authorization",
+        "[DONE]",
+    ] {
+        assert!(!first.contains(secret), "意外的日志字段 {secret}");
+    }
+    let ids: std::collections::HashSet<_> = first
+        .lines()
+        .map(|line| {
+            line.split_once("request_id=")
+                .unwrap()
+                .1
+                .split('}')
+                .next()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(ids.len(), 1);
+    finish.notify_one();
+    assert_eq!(answer.text().await.unwrap(), "data: [DONE]\n\n");
+    let complete = std::fs::read_to_string(log.path()).unwrap();
+    assert!(complete.contains("[DONE]"));
+}
+
+#[tokio::test]
+async fn disabled_body_logging_still_explains_fallback() {
+    let model = Arc::new(Model::default());
+    model.offline.store(true, Ordering::Relaxed);
+    let upstream = serve(Router::new().fallback(complete).with_state(model)).await;
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let (_relay, addr) = start_relay_with_stdout(
+        &[
+            (
+                "UPSTREAM_URL",
+                &format!("http://{upstream}/v1/chat/completions"),
+            ),
+            ("POLICY_EPOCH", "test"),
+            ("REDIS_URL", "redis://127.0.0.1:1"),
+            ("RELAY_LOG_CONTENT", "false"),
+        ],
+        log.reopen().unwrap().into(),
+    );
+    let response = client()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&json!({"model":"primary","messages":[{"role":"user","content":"私有正文"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = response.bytes().await.unwrap();
+    let logs = std::fs::read_to_string(log.path()).unwrap();
+    for event in ["upstream_status=503", "relay_fallback", "relay_history"] {
+        assert!(logs.contains(event), "缺少 {event}: {logs}");
+    }
+    for body in ["私有正文", "测试回答", "正文预览"] {
+        assert!(!logs.contains(body));
+    }
+}
+
+#[tokio::test]
+async fn long_inline_image_leaves_the_user_prompt_visible_in_logs() {
+    let upstream = serve(
+        Router::new()
+            .fallback(complete)
+            .with_state(Arc::new(Model::default())),
+    )
+    .await;
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let (_relay, addr) = start_relay_with_stdout(
+        &[
+            (
+                "UPSTREAM_URL",
+                &format!("http://{upstream}/v1/chat/completions"),
+            ),
+            ("POLICY_EPOCH", "test"),
+            ("REDIS_URL", "redis://127.0.0.1:1"),
+        ],
+        log.reopen().unwrap().into(),
+    );
+    let image = "A".repeat(3000);
+    let request = json!({"model":"primary","messages":[{"role":"user","content":[
+        {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{image}")}},
+        {"type":"text","text":"请描述画面"}
+    ]}]});
+    let response = client()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<Value>().await.unwrap()["model"], "primary");
+    let logs = std::fs::read_to_string(log.path()).unwrap();
+    assert!(logs.contains("请描述画面"), "{logs}");
+    assert!(!logs.contains(&"A".repeat(200)));
 }

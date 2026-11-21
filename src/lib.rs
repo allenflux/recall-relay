@@ -3,8 +3,10 @@
 
 mod archive;
 mod config;
+mod content_log;
 mod delivery;
 pub mod history;
+mod model_file;
 mod passthrough;
 mod relay;
 
@@ -29,6 +31,7 @@ use relay::Relay;
 pub struct Application {
     state: Arc<Service>,
     history: Option<Arc<History>>,
+    log_content: bool,
 }
 
 struct Service {
@@ -94,13 +97,29 @@ impl Application {
             chat,
             rewrites,
         });
-        Ok(Self { state, history })
+        Ok(Self {
+            state,
+            history,
+            log_content: config::flag("RELAY_LOG_CONTENT", true)?,
+        })
     }
 
     pub fn router(&self) -> Router {
+        let show_body = self.log_content;
         Router::new()
             .fallback(dispatch)
             .with_state(Arc::clone(&self.state))
+            .layer(axum::middleware::from_fn(move |req, next| {
+                content_log::observe(req, next, show_body)
+            }))
+    }
+
+    /// 启用内置向量回放时，首次读取、校验和预热模型都在接收流量之前完成。
+    pub async fn ready(&self) -> Result<()> {
+        if let Some(history) = &self.history {
+            history.ready().await?;
+        }
+        Ok(())
     }
 
     pub async fn close(&self) {

@@ -6,9 +6,9 @@ use axum::{
     response::Response,
 };
 use futures_util::StreamExt;
-use std::{io, sync::Arc, time::Duration};
+use std::{io, time::Duration};
 use tokio::{
-    sync::{OwnedSemaphorePermit, mpsc, oneshot},
+    sync::{mpsc, oneshot},
     time::{Instant, timeout, timeout_at},
 };
 
@@ -24,7 +24,6 @@ pub(crate) fn bounded<T: Send + 'static>(
     default_deadline: Instant,
 ) -> Response {
     let (mut head, body) = response.into_parts();
-    let cpu_slot = head.extensions.remove::<Arc<OwnedSemaphorePermit>>();
     let limits = head.extensions.remove::<Limits>().unwrap_or(Limits {
         wall: default_deadline,
         idle: None,
@@ -32,7 +31,7 @@ pub(crate) fn bounded<T: Send + 'static>(
     let (sender, mut receiver) = mpsc::channel::<(Bytes, oneshot::Sender<()>)>(1);
     let (finished, outcome) = oneshot::channel();
     tokio::spawn(async move {
-        let (_resource, _cpu_slot) = (resource, cpu_slot);
+        let _resource = resource;
         let pump = async {
             let mut chunks = body.into_data_stream();
             while let Some(chunk) = chunks.next().await {

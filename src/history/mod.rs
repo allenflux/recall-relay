@@ -1,15 +1,16 @@
 //! 历史模块分成读、写两条路径。主模型成功时只向有界队列投递；上游故障时
-//! 才同步查 Redis、MySQL 和近似索引。缓存不可用时，调用方还可以继续尝试备用模型。
+//! 才同步查 Redis、MySQL 和近似索引。没有可回放的记录时，调用方收到可重试错误。
 
 mod embedding;
 mod hot;
 mod identity;
+mod native;
 mod semantic;
 mod vector;
 
 use crate::{
     archive::Archive,
-    config::{flag, required, setting},
+    config::{required, setting},
 };
 use anyhow::{Context, Result, ensure};
 use embedding::Embedder;
@@ -119,11 +120,8 @@ impl History {
                 );
                 Some(floor)
             };
-            let embedder = Embedder::new(
-                &setting("HISTORY_EMBEDDING_URL", "http://127.0.0.1:11434/api/embed"),
-                setting("HISTORY_EMBEDDING_MODEL", "embeddinggemma:300m-qat-q8_0"),
-                flag("CPU_FALLBACK_ENABLED", true)?,
-            )?;
+            let model = setting("HISTORY_EMBEDDING_MODEL", "embeddinggemma:300m-qat-q8_0");
+            let embedder = Embedder::new(model)?;
             Some(Vectors {
                 mode: embedding_mode,
                 embedder,
@@ -445,6 +443,14 @@ impl History {
         Ok((None, outcome))
     }
 
+    /// 启用进程内向量时，等待模型校验、加载和首次计算完成后再对外提供服务。
+    pub async fn ready(&self) -> Result<()> {
+        if let Some(vectors) = &self.storage.vectors {
+            vectors.embedder.ready().await?;
+        }
+        Ok(())
+    }
+
     pub async fn close(&self) {
         if let Some(Workers {
             stop,
@@ -460,6 +466,9 @@ impl History {
             if let Some(task) = vector_writer {
                 task.abort();
                 let _ = task.await;
+            }
+            if let Some(vectors) = &self.storage.vectors {
+                vectors.embedder.close().await;
             }
             if let Some(db) = &self.storage.archive {
                 db.close().await;

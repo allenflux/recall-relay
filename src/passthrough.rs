@@ -140,14 +140,37 @@ pub(crate) async fn forward(proxy: &Proxy, request: Request) -> Response {
             }
         };
         let is_head = head.method == Method::HEAD;
+        // URI 可以含调用方查询串。分别记录 host、path，就能追踪路由而不写出查询参数。
+        tracing::info!(stage = "passthrough", event = "attempt", method = %head.method,
+            host = uri.host(), path = uri.path(), "relay_stage");
         let mut outgoing = hyper::Request::new(Full::new(bytes));
         *outgoing.method_mut() = head.method;
         *outgoing.uri_mut() = uri;
         *outgoing.headers_mut() = end_to_end(&head.headers, false);
-        let Ok(response) = proxy.client.request(outgoing).await else {
-            return error(StatusCode::BAD_GATEWAY, "relay_upstream_unavailable");
+        let response = match proxy.client.request(outgoing).await {
+            Ok(response) => response,
+            Err(failure) => {
+                let reason = if failure.is_connect() {
+                    "connection_error"
+                } else {
+                    "transport_error"
+                };
+                tracing::info!(
+                    stage = "passthrough",
+                    event = "failed",
+                    reason,
+                    "relay_stage"
+                );
+                return error(StatusCode::BAD_GATEWAY, "relay_upstream_unavailable");
+            }
         };
         let (head, incoming) = response.into_parts();
+        tracing::info!(
+            stage = "passthrough",
+            event = "response",
+            upstream_status = head.status.as_u16(),
+            "relay_stage"
+        );
         let preserve_length = head.status == StatusCode::NOT_MODIFIED
             || (is_head
                 && !head.status.is_informational()
@@ -157,7 +180,13 @@ pub(crate) async fn forward(proxy: &Proxy, request: Request) -> Response {
         *response.headers_mut() = end_to_end(&head.headers, preserve_length);
         crate::delivery::bounded(response, slot, deadline)
     };
-    timeout_at(deadline, operation)
-        .await
-        .unwrap_or_else(|_| error(StatusCode::BAD_GATEWAY, "relay_upstream_unavailable"))
+    timeout_at(deadline, operation).await.unwrap_or_else(|_| {
+        tracing::info!(
+            stage = "passthrough",
+            event = "failed",
+            reason = "timeout",
+            "relay_stage"
+        );
+        error(StatusCode::BAD_GATEWAY, "relay_upstream_unavailable")
+    })
 }

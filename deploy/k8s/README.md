@@ -1,10 +1,6 @@
 # RecallRelay Kubernetes 部署
 
-每个 RecallRelay Pod 运行 Relay 和 Ollama 两个容器。Relay 在 `8000` 提供集群内 Service，Ollama 只监听 Pod 内的 `127.0.0.1:11434`。Pod 的 init container 将 SmolVLM 权重准备到共享 `emptyDir`，并创建 `num_gpu 0` 的 `recall-relay-cpu:vision` 模型。Redis 和 MySQL 各自运行在独立的 StatefulSet，所有 Relay 副本通过集群内 Service 共用这两个库。
-
-当前清单默认部署一个 Relay、一个 Redis 和一个 MySQL 副本。Redis 使用 1 GiB PVC 和 AOF，MySQL 使用 10 GiB PVC，两者使用集群的默认 StorageClass。调整 [relay.yaml](relay.yaml) 的 `spec.replicas` 就能增加 Relay 副本。已有的 ClusterIP Service 会把新连接分发给就绪的 Pod。各 Pod 共用 `POLICY_EPOCH` 和 `REDIS_PREFIX`。每个 Relay Pod 各有一份 Ollama 权重和 CPU 配额，新 Pod 首次启动需要能访问 Hugging Face 下载权重。网关出口还需允许 `UPSTREAM_URL` 指定的 HTTPS 服务。
-
-同一个入口也接收普通 HTTP 请求并转发至固定网关；配置 Redis 后，聊天路径会使用历史与降级功能。
+基础部署在 Relay Pod 内运行一个 Rust 容器。Redis 和 MySQL 各有独立的 StatefulSet，分别使用 1 GiB 和 10 GiB 的 PVC。Rust Relay 在集群内的 8000 端口提供统一入口。所有 Relay 副本应使用同一套网关、策略版本和历史命名空间。
 
 ## 构建和配置
 
@@ -15,17 +11,19 @@ docker build -t registry.example.com/team/recall-relay:0.1.0 .
 docker push registry.example.com/team/recall-relay:0.1.0
 ```
 
-ConfigMap 默认使用 Python 版的网关地址和备用模型 `gemma4-31b-heretic`。客户端用请求体的 `model` 选择首发模型。向量模式下，符合条件的故障依次尝试 Redis 精确、MySQL 精确、Redis 近似和 MySQL 近似，再进入备用模型。`model_not_found` 原样返回。更换网关时可调整 `UPSTREAM_URL`、`FALLBACK_MODEL` 和 `FALLBACK_MODEL_MULTIMODAL`。[ConfigMap 配置](config.yaml)
+ConfigMap 的 `UPSTREAM_URL` 配置唯一上游。Relay 转发客户端原请求，符合条件的成功回答会异步写入历史。主请求遇到可回放故障时，先查精确缓存，再按配置查同范围的近似缓存。普通聊天请求命中后返回历史回答，缓存中没有可用回答时返回错误。[ConfigMap 配置](config.yaml)
 
 Redis 热缓存默认保留 24 小时、每个前缀最多 1024 条。Relay 在 MySQL 中自动创建 `recall_relay_history`，用命名空间哈希和请求哈希组成主键，长期保存符合入库条件的成功结果。MySQL 历史没有 TTL 或按条数淘汰，部署时需根据写入量规划 PVC 容量和备份。使用已有 MySQL 时，部署清单中可移除 `mysql.yaml`，在 ConfigMap 中设置该实例的地址、端口、库名和用户。先创建数据库并授予 Relay 用户建表及读写权限。仅使用 Redis 时，同样可移除 `mysql.yaml`，并将 `MYSQL_HOST` 设置为空字符串。
 
-### 本地 CPU 向量匹配
+### 原生 CPU 向量
 
-在 [config.yaml](config.yaml) 将 `HISTORY_EMBEDDING_MODE` 从默认 `off` 调为 `shadow` 可以观察向量命中，调为 `replay` 可用于故障回放。向量模式开启后，近似匹配使用向量。默认 `off` 时继续使用现有规则。设为 `HISTORY_NEAR_MODE=off` 会关闭所有近似回放。更新配置后重建 Relay Pod。默认模型 `embeddinggemma:300m-qat-q8_0` 的权重约 338 MB。启用时 init container 通过 Ollama 模型仓库下载，每个 Pod 在同一 `emptyDir` 保存本地模型权重。 [Ollama 模型标签](https://ollama.com/library/embeddinggemma/tags)
+基础清单默认使用 `HISTORY_EMBEDDING_MODE=off`。向量模式使用 Relay 内部的 llama.cpp 加载 GGUF。测试或调试时可将 `RELAY_LOG_CONTENT` 设为 `false` 关闭请求和响应正文日志，各方向默认预览最多 2048 个原始字节。
 
-Relay 从 Pod 内的 `127.0.0.1:11434/api/embed` 计算文本向量。它只在凭据、模型、参数和内联原图相同的范围匹配。启用后新完成的合格请求才会写入 Redis 和 MySQL 向量，同一 Redis 前缀下的各副本应统一模型和设置。MySQL 命中的记录会按需回填 Redis。使用已有 MySQL 时，给升级账号授予 `ALTER` 和 `INDEX` 以自动补齐向量字段。仅运行 CPU 向量模型时，设置 `CPU_FALLBACK_ENABLED: "false"`，init container 会跳过 SmolVLM 下载和创建。
+[原生向量 overlay](../k8s-overlays/native-vectors/kustomization.yaml) 为 Relay 只读挂载已有 PVC `recall-relay-embedding-models`，开启 `replay`，并为模型和请求预留更多内存。先在相同命名空间准备好权重卷。Rust 在卷的 `blobs/` 下按 `embeddinggemma:300m-qat-q8_0` 对应的固定 SHA-256 读取 GGUF，并校验整份文件。如果卷内放的是单个 GGUF，在 overlay 的 ConfigMap 中配置 `HISTORY_EMBEDDING_MODEL_PATH: /var/lib/recall-models/文件名.gguf`。运行用户 10001 需要具备读取权限。基础清单为 Relay 的 /tmp 挂载 768 MiB 的磁盘 emptyDir，供模型加载时写入约 338 MB 的临时兼容副本，原始 GGUF 保存在只读 PVC 中。多节点多副本部署时，选择可供对应节点共同挂载的存储方案。原 Python 清单若用的是 Pod 的 `emptyDir`，务必在替换 Pod 前将需要的权重转存到 PVC，或预先准备相同版本的权重。
 
 ## 创建 Secret 和应用清单
+
+以下命令示例部署基础清单。使用原生向量时，把 `kubectl apply -k deploy/k8s` 改为 `kubectl apply -k deploy/k8s-overlays/native-vectors`。
 
 准备以下 Secret 源文件，值采用原始文本且末尾无换行。使用两个独立的 MySQL 密码，示例可分别用 `openssl rand -hex 32` 生成。Relay Pod 只读取 MySQL 应用密码。
 
@@ -54,15 +52,13 @@ kubectl -n recall-relay rollout status deployment/recall-relay --timeout=15m
 
 ## 验证
 
-业务后端在集群内将 `CUSTOM_LLM_BASE_URL` 设为 `http://recall-relay.recall-relay.svc:8000/v1`，使用自己的网关凭据。Relay 将 `Authorization` 原样传给固定网关，由网关鉴权。首次模型下载进度可通过 `kubectl -n recall-relay logs deployment/recall-relay -c prepare-cpu-model` 查看。
+业务后端在集群内将 `CUSTOM_LLM_BASE_URL` 设为 `http://recall-relay.recall-relay.svc:8000/v1`，使用自己的网关凭据。Relay 将 `Authorization` 原样传给固定网关，由网关鉴权。
 
 ```sh
 kubectl -n recall-relay get pods,svc,pvc
 kubectl -n recall-relay exec statefulset/recall-relay-mysql -- sh -ec '
   MYSQL_PWD="$MYSQL_PASSWORD" mysql --protocol=TCP --host=127.0.0.1 \
     --user="$MYSQL_USER" --database="$MYSQL_DATABASE" --execute="SHOW INDEX FROM recall_relay_history"'
-kubectl -n recall-relay exec deployment/recall-relay -c ollama -- \
-  ollama list
 kubectl -n recall-relay port-forward svc/recall-relay 8000:8000
 ```
 

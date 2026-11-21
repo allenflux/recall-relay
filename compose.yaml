@@ -9,35 +9,30 @@ services:
         protocol: tcp
     depends_on:
       redis:
-        condition: service_started
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
     environment:
       RELAY_BIND: "0.0.0.0:8000"
+      RELAY_LOG_CONTENT: "${RELAY_LOG_CONTENT:-true}"
       INGRESS_ORIGIN: http://127.0.0.1:8000
       UPSTREAM_URL: ${UPSTREAM_URL:-https://open-sealion.aiaigirl.com/v1/chat/completions}
       POLICY_EPOCH: ${POLICY_EPOCH:-history-v1}
-      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env.compose}@redis:6379/0
-      MYSQL_HOST: ${MYSQL_HOST:-}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in the Compose env file}@redis:6379/0
+      MYSQL_HOST: ${MYSQL_HOST:-mysql}
       MYSQL_PORT: ${MYSQL_PORT:-3306}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-recall_relay}
       MYSQL_USER: ${MYSQL_USER:-recall_relay}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in the Compose env file}
       MYSQL_HISTORY_READ_TIMEOUT_SECONDS: ${MYSQL_HISTORY_READ_TIMEOUT_SECONDS:-0.25}
       HISTORY_NEAR_MODE: ${HISTORY_NEAR_MODE:-replay}
       HISTORY_EMBEDDING_MODE: ${HISTORY_EMBEDDING_MODE:-off}
       HISTORY_EMBEDDING_MODEL: ${HISTORY_EMBEDDING_MODEL:-embeddinggemma:300m-qat-q8_0}
-      HISTORY_EMBEDDING_URL: http://127.0.0.1:11434/api/embed
+      HISTORY_EMBEDDING_MODEL_DIR: ${HISTORY_EMBEDDING_MODEL_DIR:-/var/lib/recall-model-store/models}
+      HISTORY_EMBEDDING_MODEL_PATH: "${HISTORY_EMBEDDING_MODEL_PATH:-}"
       HISTORY_EMBEDDING_THRESHOLD: ${HISTORY_EMBEDDING_THRESHOLD:-0.90}
       HISTORY_EMBEDDING_LAST_RESORT_THRESHOLD: "${HISTORY_EMBEDDING_LAST_RESORT_THRESHOLD:-}"
       HISTORY_EMBEDDING_TIMEOUT_SECONDS: ${HISTORY_EMBEDDING_TIMEOUT_SECONDS:-0.65}
-      FALLBACK_MODEL: ${FALLBACK_MODEL-gemma4-31b-heretic}
-      FALLBACK_MODEL_MULTIMODAL: "true"
-      FALLBACK_MODEL_TIMEOUT_SECONDS: ${FALLBACK_MODEL_TIMEOUT_SECONDS:-12}
-      CPU_FALLBACK_ENABLED: ${CPU_FALLBACK_ENABLED:-true}
-      CPU_FALLBACK_URL: http://127.0.0.1:11434/v1/chat/completions
-      CPU_FALLBACK_MODEL: recall-relay-cpu:vision
-      CPU_FALLBACK_MULTIMODAL: "true"
-      CPU_FALLBACK_TIMEOUT_SECONDS: ${CPU_FALLBACK_TIMEOUT_SECONDS:-18}
-      CPU_FALLBACK_MAX_INFLIGHT: "1"
       TOTAL_TIMEOUT_SECONDS: ${TOTAL_TIMEOUT_SECONDS:-60}
       STREAM_TIMEOUT_SECONDS: ${STREAM_TIMEOUT_SECONDS:-600}
       UPSTREAM_TIMEOUT_SECONDS: ${UPSTREAM_TIMEOUT_SECONDS:-55}
@@ -45,7 +40,6 @@ services:
       SSE_UPSTREAM_TIMEOUT_SECONDS: "${SSE_UPSTREAM_TIMEOUT_SECONDS:-}"
       NONSTREAM_TOTAL_TIMEOUT_SECONDS: "${NONSTREAM_TOTAL_TIMEOUT_SECONDS:-}"
       NONSTREAM_UPSTREAM_TIMEOUT_SECONDS: "${NONSTREAM_UPSTREAM_TIMEOUT_SECONDS:-}"
-      NONSTREAM_FALLBACK_MODEL_TIMEOUT_SECONDS: "${NONSTREAM_FALLBACK_MODEL_TIMEOUT_SECONDS:-}"
       SULPHUR_NONSTREAM_TOTAL_TIMEOUT_SECONDS: "${SULPHUR_NONSTREAM_TOTAL_TIMEOUT_SECONDS:-}"
       SULPHUR_NONSTREAM_UPSTREAM_TIMEOUT_SECONDS: "${SULPHUR_NONSTREAM_UPSTREAM_TIMEOUT_SECONDS:-}"
       REJECT_EMPTY_JSON_COMPLETIONS: "${REJECT_EMPTY_JSON_COMPLETIONS:-false}"
@@ -53,6 +47,12 @@ services:
       MAX_PENDING: ${MAX_PENDING:-0}
       QUEUE_TIMEOUT_SECONDS: ${QUEUE_TIMEOUT_SECONDS:-15}
       MAX_BUFFERED_BODY_BYTES: ${MAX_BUFFERED_BODY_BYTES:-67108864}
+    # 沿用旧项目的卷名。原有部署对 ollama-data 的 external 映射会同时用于这里。
+    volumes:
+      - ollama-data:/var/lib/recall-model-store:ro
+    # 原生加载时要创建临时 GGUF 兼容副本，原始权重卷始终只读。
+    tmpfs:
+      - /tmp:size=768m,mode=1777
     healthcheck:
       test: ["CMD", "curl", "-fsS", "--max-time", "2", "http://127.0.0.1:8000/healthz"]
       interval: 10s
@@ -61,7 +61,7 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    mem_limit: 1g
+    mem_limit: ${RELAY_MEMORY_LIMIT:-2g}
     stop_grace_period: 75s
 
   redis:
@@ -69,7 +69,7 @@ services:
     restart: unless-stopped
     user: "999:1000"
     environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env.compose}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in the Compose env file}
     command:
       - /bin/sh
       - -ec
@@ -91,47 +91,42 @@ services:
     mem_limit: 1g
     stop_grace_period: 30s
 
-  ollama:
-    image: ollama/ollama:0.31.1
+  mysql:
+    image: mysql:8.4.13
     restart: unless-stopped
-    init: true
-    network_mode: service:relay
-    depends_on:
-      relay:
-        condition: service_started
-        restart: true
-    entrypoint: ["/bin/sh", "/usr/local/bin/start-recall-ollama.sh"]
-    command: []
+    user: "999:999"
+    command: ["--datadir=/var/lib/mysql/data"]
     environment:
-      OLLAMA_HOST: "127.0.0.1:11434"
-      OLLAMA_NO_CLOUD: "1"
-      OLLAMA_NUM_PARALLEL: "1"
-      OLLAMA_MAX_LOADED_MODELS: "1"
-      CPU_FALLBACK_ENABLED: ${CPU_FALLBACK_ENABLED:-true}
-      HISTORY_NEAR_MODE: ${HISTORY_NEAR_MODE:-replay}
-      HISTORY_EMBEDDING_MODE: ${HISTORY_EMBEDDING_MODE:-off}
-      HISTORY_EMBEDDING_MODEL: ${HISTORY_EMBEDDING_MODEL:-embeddinggemma:300m-qat-q8_0}
-      NVIDIA_VISIBLE_DEVICES: void
-      OLLAMA_VULKAN: "0"
+      MYSQL_ROOT_HOST: localhost
+      # 首次初始化时由 MySQL 官方入口生成管理员密码，Relay 只持有普通账号的密码。
+      MYSQL_RANDOM_ROOT_PASSWORD: "yes"
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-recall_relay}
+      MYSQL_USER: ${MYSQL_USER:-recall_relay}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in the Compose env file}
     healthcheck:
       test:
         - CMD-SHELL
-        - if [ "$$CPU_FALLBACK_ENABLED" = true ]; then ollama show recall-relay-cpu:vision; else ollama list; fi
-      interval: 10s
-      timeout: 5s
-      start_period: 2m
-      retries: 6
+        - >-
+          MYSQL_PWD="$$MYSQL_PASSWORD" mysql --protocol=TCP --host=127.0.0.1
+          --user="$$MYSQL_USER" --database="$$MYSQL_DATABASE" --execute='SELECT 1' >/dev/null
+      interval: 5s
+      timeout: 4s
+      start_period: 30s
+      retries: 15
     volumes:
-      - ollama-data:/root/.ollama
-      - ./deploy/compose/start-ollama.sh:/usr/local/bin/start-recall-ollama.sh:ro
+      - mysql-data:/var/lib/mysql
     tmpfs:
+      - /var/run/mysqld:uid=999,gid=999,mode=0700
       - /tmp
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    cpus: 2
-    mem_limit: 2g
+    mem_limit: 1g
+    stop_grace_period: 60s
 
 volumes:
   redis-data:
+  mysql-data:
   ollama-data:
+    name: ${MODEL_VOLUME_NAME:-${COMPOSE_PROJECT_NAME}_ollama-data}
+    external: ${MODEL_VOLUME_EXTERNAL:-false}

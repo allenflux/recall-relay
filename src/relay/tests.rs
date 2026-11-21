@@ -26,7 +26,7 @@ fn credential_context_matches_the_python_digest() {
     headers.insert("accept", HeaderValue::from_bytes(&[0xe9]).unwrap());
     headers.insert("x-request-id", HeaderValue::from_static("ignored"));
     assert_eq!(
-        context_digest("/v1/中", "a=1&a=2", &headers, Some(b"Bearer example")),
+        context_digest("/v1/中", "a=1&a=2", &headers, b"Bearer example"),
         "0a371ddfb397f2b5d4c2312669efecf9164a2d23a3ca947769b5428373306e00"
     );
 }

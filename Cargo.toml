@@ -2,7 +2,7 @@
 name = "recall-relay"
 version = "0.1.0"
 edition = "2024"
-description = "带历史回放与模型降级的固定上游 HTTP 中继"
+description = "成功响应写入缓存、上游故障时回放的 HTTP 中间件"
 
 [dependencies]
 anyhow = "1"
@@ -15,6 +15,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "webpki-tokio"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+llama-cpp-sys-2 = { version = "=0.1.161", default-features = false }
 rand = "0.9"
 redis = { version = "1.6", default-features = false, features = ["tokio-rustls-comp"] }
 regex = "1"
@@ -22,6 +23,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip", "arbitrary_precision"] }
 sha2 = "0.10"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "mysql", "tls-rustls-ring-webpki"] }
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "sync", "time", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

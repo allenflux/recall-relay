@@ -1,5 +1,5 @@
-//! 一次调用只访问一个预先配置的地址。返回 Ok 表示已选定交给客户端的响应；
-//! Err(status) 表示尚未提交任何响应，可以由调用方进入下一个降级阶段。
+//! 每个聊天请求只调用一次固定上游。正常响应直接转发；可回放的故障保留原响应，
+//! 调用方查不到历史时，仍能把上游的错误状态、正文和重试时间交给客户端。
 
 use super::{
     Turn, error,
@@ -11,24 +11,14 @@ use axum::{
     http::{HeaderMap, HeaderValue},
     response::Response,
 };
+use futures_util::TryStreamExt;
 use reqwest::Url;
 use std::{io, sync::Arc, time::Duration};
 use tokio::time::{Instant, timeout_at};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Source {
-    Primary,
-    Model,
-    Cpu,
-}
-impl Source {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Primary => "primary",
-            Self::Model => "model",
-            Self::Cpu => "cpu",
-        }
-    }
+pub(super) enum UpstreamOutcome {
+    Forward(Response),
+    CheckHistory(Response),
 }
 pub(super) async fn read_bounded(
     mut response: reqwest::Response,
@@ -50,32 +40,56 @@ impl Turn {
         url: Url,
         raw: Bytes,
         headers: HeaderMap,
-        source: Source,
         allowance: Duration,
-        reserve: Duration,
-    ) -> Result<Response, u16> {
+    ) -> UpstreamOutcome {
         let available = self
             .deadline
             .saturating_duration_since(Instant::now())
             .saturating_sub(Duration::from_millis(20));
-        let mut remaining = available.saturating_sub(reserve);
+        let mut remaining = available.saturating_sub(self.relay.c.fallback_budget);
         // 上传较慢时，仍让主模型在剩余的总预算内尝试一次。
-        if source == Source::Primary && remaining.is_zero() {
+        if remaining.is_zero() {
             remaining = available;
         }
         if remaining.is_zero() {
-            return Err(503);
+            tracing::info!(
+                stage = "primary",
+                event = "skipped",
+                reason = "deadline",
+                "relay_stage"
+            );
+            return UpstreamOutcome::CheckHistory(error(
+                503,
+                "request_deadline",
+                true,
+                self.relay.c.retry_after,
+            ));
         }
-        self.relay.count(match source {
-            Source::Primary => "upstream_calls",
-            Source::Model => "model_calls",
-            Source::Cpu => "cpu_calls",
-        });
+        self.relay.count("upstream_calls");
         let started = Instant::now();
         let cutoff = started + allowance.min(remaining);
+        let model = self.request["model"].as_str();
+        // 上游 URL 可能携带固定查询参数，日志只记录主机、路径及有限长度的普通模型标识。
+        let model = model.filter(|name| {
+            name.len() <= 160
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_./:".contains(&b))
+        });
+        tracing::info!(
+            stage = "primary",
+            event = "attempt",
+            model,
+            host = url.host_str(),
+            path = url.path(),
+            streaming = self.streaming,
+            budget_ms = allowance.min(remaining).as_millis() as u64,
+            "relay_stage"
+        );
         let mut status = None;
         let mut terminal = None;
         let mut failure_status = 503;
+        let mut upstream_error = None;
         let mut reason = "http_error";
         let result = timeout_at(cutoff, async {
             let mut upstream = self
@@ -86,7 +100,16 @@ impl Turn {
                 .body(raw)
                 .send()
                 .await
-                .map_err(|_| Fault::Transport)?;
+                .map_err(|error| {
+                    if error.is_timeout() {
+                        Fault::Timeout
+                    } else {
+                        if error.is_connect() {
+                            reason = "connection_error";
+                        }
+                        Fault::Transport
+                    }
+                })?;
             let code = upstream.status().as_u16();
             status = Some(code);
             let ty = upstream.headers().get("content-type").cloned();
@@ -108,25 +131,33 @@ impl Turn {
                     "application/json"
                 })
             });
+            let retry = upstream.headers().get("retry-after").cloned();
+            let challenge = upstream.headers().get("www-authenticate").cloned();
             let finish = |body: Body| {
-                reply(
-                    code,
-                    body,
-                    ty.clone(),
-                    (source != Source::Primary && code == 200).then_some(source.name()),
-                )
+                let mut response = reply(code, body, ty.clone(), None);
+                if code >= 400 {
+                    if let Some(value) = &retry {
+                        response.headers_mut().insert("retry-after", value.clone());
+                    }
+                    if let Some(value) = &challenge {
+                        response
+                            .headers_mut()
+                            .insert("www-authenticate", value.clone());
+                    }
+                }
+                response
             };
             let limit = self.relay.c.max_response;
 
             if code == 408 || code == 429 || code >= 500 {
-                if code == 429 {
-                    failure_status = 429;
-                }
+                failure_status = code;
                 let body = read_bounded(upstream, limit.min(64 * 1024)).await?;
                 if protocol::model_not_found(&body) {
+                    reason = "model_not_found";
                     self.relay.count("terminal_model_not_found");
                     return Ok(Some(finish(Body::from(body))));
                 }
+                upstream_error = Some(finish(Body::from(body)));
                 return Ok(None);
             }
             if code != 200 {
@@ -134,16 +165,12 @@ impl Turn {
                 terminal = Some(code);
                 let body = read_bounded(upstream, limit).await?;
                 if code == 400
-                    && source != Source::Model
-                    && let Some((kind, s)) = protocol::capability_failure(&body)
-                    && (source == Source::Primary || kind == "context_limit")
+                    && let Some((kind, _)) = protocol::capability_failure(&body)
                 {
                     terminal = None;
-                    failure_status = s;
+                    failure_status = code;
                     reason = kind;
-                    if source == Source::Cpu {
-                        self.relay.count("cpu_context_exceeded");
-                    }
+                    upstream_error = Some(finish(Body::from(body)));
                     return Ok(None);
                 }
                 return Ok(Some(finish(Body::from(body))));
@@ -156,7 +183,7 @@ impl Turn {
                 }
                 return Ok(Some(finish(Body::from(body))));
             }
-            let can_store = source == Source::Primary && self.identity.is_some();
+            let can_store = self.identity.is_some();
             if !self.streaming {
                 let body = read_bounded(upstream, limit).await?;
                 let capture = if can_store && is_json {
@@ -166,9 +193,7 @@ impl Turn {
                 };
                 if capture.is_none() && replayable_format {
                     protocol::validate_live(&body, self.reject).inspect_err(|_| {
-                        if source == Source::Primary {
-                            self.relay.count("ingest_invalid");
-                        }
+                        self.relay.count("ingest_invalid");
                     })?;
                 }
                 let turn = self.clone();
@@ -176,15 +201,15 @@ impl Turn {
                 let output = async_stream::stream! {
                     yield Ok::<_, io::Error>(body);
                     if let (Some(identity), Some(capture)) = (&turn.identity, capture) {
-                        turn.relay.history.enqueue(identity, capture);
-                    } else if source == Source::Primary {
+                        turn.enqueue_answer(identity, capture);
+                    } else {
                         turn.relay.count("ingest_invalid");
                     }
                 };
                 return Ok(Some(finish(Body::from_stream(output))));
             }
             let first = sse::first_chunks(&mut upstream, is_sse, limit, self.reject).await?;
-            let output = self.streaming_body(upstream, first, is_sse, can_store, allowance, cutoff);
+            let output = self.streaming_body(upstream, first, is_sse, allowance, cutoff);
             let mut response = finish(output);
             response.extensions_mut().insert(crate::delivery::Limits {
                 wall: if is_sse {
@@ -199,38 +224,64 @@ impl Turn {
         .await
         .unwrap_or(Err(Fault::Timeout));
         match result {
-            Ok(Some(response)) => return Ok(response),
+            Ok(Some(response)) => {
+                // 流式请求在此只选定响应，剩余字节仍受流读取超时和完整性检查约束。
+                let reason = if response.status().is_success() {
+                    "accepted"
+                } else {
+                    reason
+                };
+                tracing::info!(
+                    stage = "primary",
+                    event = "response",
+                    reason,
+                    upstream_status = status,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "relay_stage"
+                );
+                return UpstreamOutcome::Forward(response);
+            }
             Ok(None) => {}
             Err(fault) => {
-                reason = fault.reason();
+                if !(fault == Fault::Transport && reason == "connection_error") {
+                    reason = fault.reason();
+                }
                 if matches!(fault, Fault::Temporary(_)) {
                     failure_status = fault.status();
                 }
             }
         }
-        eprintln!(
-            "relay_stage request_id={} stage={} reason={} http={} elapsed_s={:.3}",
-            self.request_id,
-            source.name(),
+        tracing::info!(
+            stage = "primary",
+            event = "failed",
             reason,
-            status.map(|c| c.to_string()).as_deref().unwrap_or("-"),
-            started.elapsed().as_secs_f64()
+            upstream_status = status,
+            retry_status = terminal.is_none().then_some(failure_status),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "relay_stage"
         );
         let retry_after = self.relay.c.retry_after;
         match terminal {
-            Some(code @ (401 | 403)) => Ok(error(
+            Some(code @ (401 | 403)) => UpstreamOutcome::Forward(error(
                 code,
                 "upstream_authentication_failed",
                 false,
                 retry_after,
             )),
-            Some(_) => Ok(error(
+            Some(_) => UpstreamOutcome::Forward(error(
                 503,
                 "upstream_error_response_interrupted",
                 true,
                 retry_after,
             )),
-            None => Err(failure_status),
+            None => UpstreamOutcome::CheckHistory(upstream_error.unwrap_or_else(|| {
+                error(
+                    failure_status,
+                    "retryable_upstream_failure",
+                    true,
+                    retry_after,
+                )
+            })),
         }
     }
 
@@ -239,7 +290,6 @@ impl Turn {
         mut upstream: reqwest::Response,
         first: Vec<Bytes>,
         is_sse: bool,
-        can_store: bool,
         idle: Duration,
         initial_cutoff: Instant,
     ) -> Body {
@@ -250,6 +300,7 @@ impl Turn {
         } else {
             initial_cutoff
         };
+        let can_store = self.identity.is_some();
         let mut cutoff = if is_sse {
             wall.min(Instant::now() + idle)
         } else {
@@ -292,13 +343,22 @@ impl Turn {
             }
             if let (Some(identity), Some(captured)) = (&turn.identity, capture)
                 && let Some(body) = protocol::prepare_history(&captured, &turn.request, true, turn.reject) {
-                turn.relay.history.enqueue(identity, body);
+                turn.enqueue_answer(identity, body);
             }
         };
         // 明确错误类型，使生成器内的 ? 使用标准 I/O 错误终止流。
         fn typed<S: futures_util::Stream<Item = Result<Bytes, io::Error>>>(stream: S) -> S {
             stream
         }
-        Body::from_stream(typed(stream))
+        // HTTP 响应体稍后会在独立任务中读取。保存此请求的 span，确保半途断流也能关联到同一请求。
+        let span = self.span.clone();
+        Body::from_stream(typed(stream).inspect_err(move |error| {
+            let reason = match error.kind() {
+                io::ErrorKind::TimedOut => "timeout",
+                io::ErrorKind::UnexpectedEof => "incomplete_sse",
+                _ => "transport_error",
+            };
+            tracing::info!(parent: &span, stage = "primary", event = "stream_failed", reason, "relay_stage");
+        }))
     }
 }

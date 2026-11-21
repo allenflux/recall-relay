@@ -15,6 +15,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "recall_relay=info".into()),
         )
         .with_target(false)
+        .with_ansi(false)
         .init();
     let bind: SocketAddr = std::env::var("RELAY_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8000".to_owned())
@@ -25,6 +26,7 @@ async fn main() -> Result<()> {
         .context("无法绑定 RELAY_BIND")?;
     let addr = listener.local_addr()?;
     let app = Application::from_env(addr)?;
+    app.ready().await?;
 
     eprintln!("RecallRelay 已启动，监听 {addr}");
     let result = axum::serve(listener, app.router())

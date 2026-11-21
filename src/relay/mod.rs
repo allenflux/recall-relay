@@ -34,7 +34,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::{Instant, timeout, timeout_at},
 };
-use upstream::Source;
+use upstream::UpstreamOutcome;
 use uuid::Uuid;
 
 pub struct Relay {
@@ -45,7 +45,6 @@ pub struct Relay {
     client: reqwest::Client,
     slots: Arc<Semaphore>,
     waiting: Arc<Semaphore>,
-    cpu: Arc<Semaphore>,
     buffered: Arc<AtomicUsize>,
     counters: Mutex<HashMap<String, u64>>,
 }
@@ -64,7 +63,6 @@ impl Relay {
             models_url,
             slots,
             waiting: Arc::new(Semaphore::new(config.max_pending)),
-            cpu: Arc::new(Semaphore::new(config.cpu_max_inflight)),
             buffered: Arc::new(AtomicUsize::new(0)),
             counters: Mutex::default(),
             c: config,
@@ -179,36 +177,64 @@ fn filtered(headers: &HeaderMap, allowed: &[&'static str], repeat: bool) -> Head
 }
 
 async fn models(relay: &Relay, url: Url, headers: &HeaderMap) -> Response {
+    tracing::info!(
+        stage = "models",
+        event = "attempt",
+        host = url.host_str(),
+        path = url.path(),
+        "relay_stage"
+    );
     let request = relay.client.get(url).headers(filtered(
         headers,
         &["authorization", "accept", "x-request-id"],
         true,
     ));
+    let mut upstream_status = None;
     let result = timeout(
         relay.c.upstream_timeout.min(Duration::from_secs(10)),
         async {
-            let upstream = request.send().await.ok()?;
+            let upstream = request
+                .send()
+                .await
+                .map_err(|_| protocol::Fault::Transport)?;
             let status = upstream.status();
+            upstream_status = Some(status.as_u16());
             let mut headers = filtered(
                 upstream.headers(),
                 &["content-type", "retry-after", "www-authenticate"],
                 true,
             );
             headers.insert("cache-control", HeaderValue::from_static("no-store"));
-            let body = upstream::read_bounded(upstream, relay.c.max_response)
-                .await
-                .ok()?;
+            let body = upstream::read_bounded(upstream, relay.c.max_response).await?;
             let mut response = Response::new(Body::from(body));
             *response.status_mut() = status;
             *response.headers_mut() = headers;
-            Some(response)
+            Ok(response)
         },
     )
-    .await;
-    result
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| error(503, "model_list_unavailable", true, relay.c.retry_after))
+    .await
+    .unwrap_or(Err(protocol::Fault::Timeout));
+    match result {
+        Ok(response) => {
+            tracing::info!(
+                stage = "models",
+                event = "response",
+                upstream_status,
+                "relay_stage"
+            );
+            response
+        }
+        Err(fault) => {
+            tracing::info!(
+                stage = "models",
+                event = "failed",
+                reason = fault.reason(),
+                upstream_status,
+                "relay_stage"
+            );
+            error(503, "model_list_unavailable", true, relay.c.retry_after)
+        }
+    }
 }
 
 pub(crate) fn decoded_path(path: &str) -> String {
@@ -313,7 +339,14 @@ pub(crate) async fn handle(relay: Arc<Relay>, request: Request, path: String) ->
         return error(400, "invalid_request", false, c.retry_after);
     };
     let streaming = request["stream"].as_bool().unwrap_or(false);
-    let (total, primary, alternate) = c.timeouts(streaming, sulphur);
+    if parts
+        .extensions
+        .get::<crate::content_log::ShowContent>()
+        .is_some()
+    {
+        crate::content_log::image_prompt(&request, &raw);
+    }
+    let (total, primary) = c.timeouts(streaming, sulphur);
     let deadline = started + total;
     let response = timeout_at(
         deadline - Duration::from_millis(10),
@@ -330,7 +363,6 @@ pub(crate) async fn handle(relay: Arc<Relay>, request: Request, path: String) ->
                 deadline,
             },
             primary,
-            alternate,
         ),
     )
     .await
@@ -353,21 +385,24 @@ struct RequestInfo<'a> {
 /// Arc 让返回的流也能持有这些数据。HTTP 处理函数退出时，流可能还在等待下一块模型输出。
 struct Turn {
     relay: Arc<Relay>,
+    span: tracing::Span,
     request: Value,
     identity: Option<Identity>,
     streaming: bool,
     reject: bool,
     deadline: Instant,
-    request_id: String,
+}
+
+impl Turn {
+    /// 正文成功交付后才入队。后台写入稍后执行，日志只记录队列是否接收了这份回答。
+    fn enqueue_answer(&self, identity: &Identity, body: Vec<u8>) {
+        let queued = self.relay.history.enqueue(identity, body);
+        tracing::info!(parent: &self.span, queued, streaming = self.streaming, "relay_cache");
+    }
 }
 
 impl Relay {
-    async fn conversation(
-        self: &Arc<Self>,
-        info: RequestInfo<'_>,
-        primary: Duration,
-        alternate: Duration,
-    ) -> Response {
+    async fn conversation(self: &Arc<Self>, info: RequestInfo<'_>, primary: Duration) -> Response {
         let RequestInfo {
             path,
             query,
@@ -386,7 +421,6 @@ impl Relay {
             .next()
             .map(HeaderValue::as_bytes)
             .filter(|bytes| !bytes.is_empty() && auth.next().is_none());
-        let digest = context_digest(&path, query, &forwarded, credential);
         let format = protocol::replay_format(&request);
         let one = request.get("n").is_none_or(|n| n.as_i64() == Some(1));
         let reject = c.reject_empty_json
@@ -394,90 +428,44 @@ impl Relay {
             && (format == Some("json_object")
                 || format == Some("text") && request.get("response_format").is_none());
         let allow_prompt = sulphur && !streaming && one && format == Some("text");
-        let identity = format
-            .and_then(|_| canonicalize("default", &format!("{}:{digest}", c.policy), &request));
-        let mut cpu_headers = forwarded;
-        cpu_headers
+        // 没有唯一凭据的请求无法安全查历史，直接跳过正文规范化和图片摘要的计算。
+        let identity = credential.filter(|_| format.is_some()).and_then(|token| {
+            let digest = context_digest(&path, query, &forwarded, token);
+            canonicalize("default", &format!("{}:{digest}", c.policy), &request)
+        });
+        let mut gateway_headers = forwarded;
+        gateway_headers
             .entry("content-type")
             .or_insert(HeaderValue::from_static("application/json"));
-        let mut gateway_headers = cpu_headers.clone();
         for h in headers.get_all("authorization") {
             gateway_headers.append("authorization", h.clone());
         }
-        let request_id = headers
-            .get_all("x-relay-request-id")
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .find(|v| {
-                v.len() == 32
-                    && v.bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            })
-            .unwrap_or("-")
-            .to_owned();
-
-        let mut stages = Vec::new();
-        if identity.is_some() {
-            let images = request["messages"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|m| {
-                    m["content"]
-                        .as_array()
-                        .is_some_and(|parts| parts.iter().any(|p| p["type"] == "image_url"))
-                });
-            if !c.fallback_model.is_empty()
-                && request["model"] != c.fallback_model
-                && (!images || c.fallback_model_multimodal)
-            {
-                stages.push((
-                    Source::Model,
-                    upstream.clone(),
-                    &c.fallback_model,
-                    alternate,
-                ));
-            }
-            if !c.cpu_fallback_url.is_empty() && (!images || c.cpu_fallback_multimodal) {
-                stages.push((
-                    Source::Cpu,
-                    Url::parse(&c.cpu_fallback_url).expect("URL checked at startup"),
-                    &c.cpu_fallback_model,
-                    c.cpu_fallback_timeout,
-                ));
-            }
-        }
-        let mut reserve: Duration = stages.iter().map(|s| s.3).sum();
         // 无凭据或 Authorization 重复时，仍可调用模型；历史读写只允许单一、非空凭据。
         let turn = Arc::new(Turn {
             relay: self.clone(),
+            span: tracing::Span::current(),
             request,
-            identity: identity.filter(|_| credential.is_some()),
+            identity,
             streaming,
             reject,
             deadline,
-            request_id,
         });
-        let primary_status = match turn
-            .attempt(
-                upstream,
-                raw,
-                gateway_headers.clone(),
-                Source::Primary,
-                primary,
-                c.fallback_budget + reserve,
-            )
-            .await
-        {
-            Ok(response) => return response,
-            Err(status) => status,
+        let failure = match turn.attempt(upstream, raw, gateway_headers, primary).await {
+            UpstreamOutcome::Forward(response) => return response,
+            UpstreamOutcome::CheckHistory(response) => response,
         };
+        let primary_status = failure.status().as_u16();
         self.count("fallback_entered");
+        tracing::info!(
+            outcome = "entered",
+            primary_retry_status = primary_status,
+            "relay_fallback"
+        );
         let mut outcome = "ineligible";
         if let Some(id) = turn.identity.as_ref() {
             let remaining = deadline
                 .saturating_duration_since(Instant::now())
-                .saturating_sub(reserve + Duration::from_millis(20));
+                .saturating_sub(Duration::from_millis(20));
             if !remaining.is_zero() {
                 let validate =
                     |body: &[u8]| protocol::prepare_history(body, &turn.request, streaming, reject);
@@ -489,6 +477,7 @@ impl Relay {
                 {
                     Ok((Some(body), reason)) => {
                         self.count(&format!("fallback_{reason}"));
+                        tracing::info!(outcome = "hit", reason, "relay_history");
                         return reply(
                             200,
                             Body::from(body),
@@ -506,44 +495,10 @@ impl Relay {
             }
         }
         self.count(&format!("lookup_{outcome}"));
-        let had_stages = !stages.is_empty();
-        for (source, url, model, duration) in stages {
-            reserve = reserve.saturating_sub(duration);
-            let mut body = turn.request.clone();
-            body["model"] = json!(model);
-            let mut cpu_slot = None;
-            let stage_headers = if source == Source::Cpu {
-                let Ok(slot) = self.cpu.clone().try_acquire_owned() else {
-                    self.count("cpu_rejected");
-                    continue;
-                };
-                cpu_slot = Some(slot);
-                if let Some(map) = body.as_object_mut() {
-                    map.remove("chat_template_kwargs");
-                }
-                cpu_headers.clone()
-            } else {
-                gateway_headers.clone()
-            };
-            if let Ok(mut response) = turn
-                .attempt(
-                    url,
-                    Bytes::from(body.to_string()),
-                    stage_headers,
-                    source,
-                    duration,
-                    reserve,
-                )
-                .await
-            {
-                if let Some(slot) = cpu_slot {
-                    response.extensions_mut().insert(Arc::new(slot));
-                }
-                return response;
-            }
-        }
+        tracing::info!(outcome = "miss", reason = outcome, "relay_history");
         if allow_prompt && let Some(prompt) = sulphur::prompt(&turn.request) {
             self.count("fallback_prompt_echo");
+            tracing::info!(outcome = "prompt", "relay_fallback");
             let created = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -557,27 +512,19 @@ impl Relay {
                 Some("prompt"),
             );
         }
-        error(
-            primary_status,
-            if outcome == "unavailable" && !had_stages {
-                "history_unavailable"
-            } else {
-                "retryable_upstream_failure"
-            },
-            true,
-            c.retry_after,
-        )
+        tracing::info!(
+            outcome = "exhausted",
+            reason = outcome,
+            response_status = primary_status,
+            "relay_fallback"
+        );
+        failure
     }
 }
 
 /// Python 的 json.dumps 默认带空格并转义非 ASCII 字符。摘要的输入必须逐字节一致，
 /// 否则移植前写入的 Redis 和 MySQL 记录就无法命中。
-fn context_digest(
-    path: &str,
-    query: &str,
-    headers: &HeaderMap,
-    credential: Option<&[u8]>,
-) -> String {
+fn context_digest(path: &str, query: &str, headers: &HeaderMap, credential: &[u8]) -> String {
     let quoted =
         |s: &str| json::escape_non_ascii(serde_json::to_string(s).expect("JSON 字符串可序列化"));
     let mut business = BTreeMap::new();
@@ -596,12 +543,10 @@ fn context_digest(
         quoted(&hex::encode(query.as_bytes())),
         format!("{{{}}}", pairs.join(", ")),
     ];
-    if let Some(credential) = credential {
-        parts.push(format!(
-            "[\"client-auth-v1\", \"{:x}\"]",
-            Sha256::digest(credential)
-        ));
-    }
+    parts.push(format!(
+        "[\"client-auth-v1\", \"{:x}\"]",
+        Sha256::digest(credential)
+    ));
     format!(
         "{:x}",
         Sha256::digest(format!("[{}]", parts.join(", ")).as_bytes())
