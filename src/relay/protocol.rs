@@ -10,6 +10,7 @@ pub(super) enum Fault {
     Protocol,
     Empty,
     Temporary(u16),
+    UpstreamError,
     Timeout,
     Transport,
     TooLarge,
@@ -27,6 +28,7 @@ impl Fault {
             Self::Protocol => "protocol_error",
             Self::Empty => "empty_response",
             Self::Temporary(_) => "embedded_upstream_error",
+            Self::UpstreamError => "unknown_upstream_error",
             Self::Timeout => "timeout",
             Self::Transport => "transport_error",
             Self::TooLarge => "invalid_response",
@@ -119,7 +121,7 @@ pub(super) fn validate_live(raw: &[u8], reject: bool) -> Result<(), Fault> {
     let v = strict_json(raw)
         .filter(Value::is_object)
         .ok_or(Fault::Protocol)?;
-    if v.get("error").is_some() || v.get("refusal").is_some() {
+    if has_error(&v) || embedded_terminal(&v) {
         return embedded_error(&v);
     }
     let choices = v["choices"]
@@ -150,25 +152,61 @@ pub(super) fn validate_live(raw: &[u8], reject: bool) -> Result<(), Fault> {
     Ok(())
 }
 
-pub(super) fn model_not_found(raw: &[u8]) -> bool {
-    fn missing(s: &str) -> bool {
-        matches!(
-            s.trim().to_ascii_lowercase().as_str(),
-            "model_not_found" | "model not found"
-        )
-    }
-    if missing(&String::from_utf8_lossy(raw)) {
-        return true;
-    }
-    let Some(v) = strict_json(raw).filter(Value::is_object) else {
+// 某些网关用 HTTP 400/200 包装鉴权或内容政策拒绝。这里仅检查错误字段和明确的
+// 拒绝标记，不会因为正常回答里出现了 “error” 或 “permission” 就去回放。
+fn denial_text(text: &str) -> bool {
+    let label = text.split(':').next().unwrap_or("").trim();
+    if label.len() > 64 {
         return false;
-    };
-    let e = v.get("error").unwrap_or(&v);
-    e.as_str().is_some_and(missing)
-        || ["code", "type"].iter().any(|k| {
-            e[k].as_str()
-                .is_some_and(|s| s.eq_ignore_ascii_case("model_not_found"))
-        })
+    }
+    matches!(
+        label.to_ascii_lowercase().replace([' ', '-'], "_").as_str(),
+        "model_not_found"
+            | "unauthorized"
+            | "forbidden"
+            | "invalid_api_key"
+            | "invalid_api_key_provided"
+            | "invalid_token"
+            | "permission_denied"
+            | "permission_error"
+            | "insufficient_permissions"
+            | "access_denied"
+            | "authentication_error"
+            | "authentication_failed"
+            | "authentication_required"
+            | "content_filter"
+            | "content_policy_violation"
+            | "refusal"
+            | "401"
+            | "403"
+            | "404"
+            | "407"
+            | "451"
+    )
+}
+
+fn terminal_fields(value: &Value) -> bool {
+    if let Some(s) = value.as_str() {
+        return denial_text(s);
+    }
+    ErrorTags::parse(value).terminal() || value["message"].as_str().is_some_and(denial_text)
+}
+
+pub(super) fn embedded_terminal(v: &Value) -> bool {
+    truthy(&v["refusal"]) || terminal_fields(v) || v.get("error").is_some_and(terminal_fields)
+}
+
+pub(super) fn terminal_error(raw: &[u8]) -> bool {
+    strict_json(raw).map_or_else(
+        || std::str::from_utf8(raw).is_ok_and(denial_text),
+        |value| embedded_terminal(&value),
+    )
+}
+
+pub(super) fn has_error(v: &Value) -> bool {
+    v["type"] == "error"
+        || v.get("error")
+            .is_some_and(|err| err.is_object() || truthy(err))
 }
 
 struct ErrorTags {
@@ -177,7 +215,7 @@ struct ErrorTags {
 }
 impl ErrorTags {
     fn parse(e: &Value) -> Self {
-        let codes = ["code", "type"]
+        let codes = ["code", "type", "error_type"]
             .iter()
             .filter_map(|k| e[k].as_str().map(|s| s.trim().to_ascii_lowercase()))
             .collect();
@@ -198,15 +236,11 @@ impl ErrorTags {
         tags.iter().any(|tag| self.codes.contains(*tag))
     }
     fn terminal(&self) -> bool {
-        self.has(&[
-            "model_not_found",
-            "authentication_error",
-            "invalid_api_key",
-            "permission_denied",
-            "content_filter",
-            "content_policy_violation",
-            "refusal",
-        ]) || self.statuses.iter().any(|s| matches!(s, 401 | 403 | 404))
+        self.codes.iter().any(|s| denial_text(s))
+            || self
+                .statuses
+                .iter()
+                .any(|s| matches!(s, 401 | 403 | 404 | 407 | 451))
     }
     fn temporary(&self) -> Option<u16> {
         if self.terminal() {
@@ -214,6 +248,7 @@ impl ErrorTags {
         }
         if self.statuses.contains(&429)
             || self.has(&[
+                "rate_limit",
                 "rate_limit_exceeded",
                 "rate_limit_error",
                 "too_many_requests",
@@ -233,6 +268,7 @@ impl ErrorTags {
                 "temporarily_unavailable",
                 "provider_unavailable",
                 "overloaded",
+                "overloaded_error",
                 "model_overloaded",
                 "gateway_timeout",
                 "request_timeout",
@@ -249,13 +285,14 @@ impl ErrorTags {
 }
 
 pub(super) fn embedded_error(v: &Value) -> Result<(), Fault> {
-    if !truthy(&v["refusal"])
-        && v["error"].is_object()
-        && let Some(status) = ErrorTags::parse(&v["error"]).temporary()
-    {
-        return Err(Fault::Temporary(status));
+    if !has_error(v) || embedded_terminal(v) {
+        return Ok(());
     }
-    Ok(())
+    let error = v.get("error").unwrap_or(v);
+    Err(match ErrorTags::parse(error).temporary() {
+        Some(status) => Fault::Temporary(status),
+        None => Fault::UpstreamError,
+    })
 }
 
 pub(super) fn capability_failure(raw: &[u8]) -> Option<(&'static str, u16)> {
@@ -333,7 +370,11 @@ pub(super) fn prepare_history(
         super::sse::history_text(raw)?
     } else {
         let mut v = strict_json(raw)?;
-        if v.get("error").is_some() || v.get("refusal").is_some() {
+        if has_error(&v)
+            || v.get("error").is_some()
+            || embedded_terminal(&v)
+            || v.get("refusal").is_some()
+        {
             return None;
         }
         let [choice] = v["choices"].as_array()?.as_slice() else {
@@ -343,6 +384,8 @@ pub(super) fn prepare_history(
         if !index_zero(choice)
             || choice["finish_reason"] != "stop"
             || message["role"] != "assistant"
+            || choice.get("error").is_some()
+            || truthy(&choice["refusal"])
             || truthy(&message["refusal"])
             || message
                 .as_object()?

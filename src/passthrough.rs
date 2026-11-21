@@ -1,6 +1,6 @@
 //! 通用 HTTP 转发：把 HTTP 请求发给固定上游。这里完全不需要识别 JSON 或模型名称。
 
-use std::{collections::HashSet, sync::Arc};
+use std::collections::HashSet;
 
 use axum::{
     body::{Body, Bytes, to_bytes},
@@ -14,10 +14,7 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
-use tokio::{
-    sync::Semaphore,
-    time::{Instant, timeout_at},
-};
+use tokio::time::{Instant, timeout_at};
 
 use crate::config::ProxyConfig;
 
@@ -26,11 +23,10 @@ type Upstream = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 pub(crate) struct Proxy {
     config: ProxyConfig,
     client: Upstream,
-    slots: Arc<Semaphore>,
 }
 
 impl Proxy {
-    pub fn new(config: ProxyConfig, slots: Arc<Semaphore>) -> Self {
+    pub fn new(config: ProxyConfig) -> Self {
         let connector = HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
@@ -38,14 +34,9 @@ impl Proxy {
             .build();
         // 每个请求最多向上游发起一次；POST 可能已经产生副作用。
         let client = Client::builder(TokioExecutor::new())
-            .pool_max_idle_per_host(config.max_inflight)
             .retry_canceled_requests(false)
             .build(connector);
-        Self {
-            config,
-            client,
-            slots,
-        }
+        Self { config, client }
     }
 }
 
@@ -93,10 +84,6 @@ fn error(status: StatusCode, code: &str) -> Response {
         .into_response();
     res.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        res.headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
-    }
     res
 }
 
@@ -115,9 +102,6 @@ fn upstream_target(origin: &Uri, method: &Method, target: &Uri) -> Option<Uri> {
 }
 
 pub(crate) async fn forward(proxy: &Proxy, request: Request) -> Response {
-    let Ok(slot) = proxy.slots.clone().try_acquire_owned() else {
-        return error(StatusCode::TOO_MANY_REQUESTS, "relay_capacity");
-    };
     let (head, body) = request.into_parts();
     if matches!(head.method, Method::CONNECT | Method::TRACE) {
         return error(StatusCode::METHOD_NOT_ALLOWED, "method_not_supported");
@@ -178,7 +162,7 @@ pub(crate) async fn forward(proxy: &Proxy, request: Request) -> Response {
         let mut response = Response::new(Body::new(incoming));
         *response.status_mut() = head.status;
         *response.headers_mut() = end_to_end(&head.headers, preserve_length);
-        crate::delivery::bounded(response, slot, deadline)
+        crate::delivery::bounded(response, deadline)
     };
     timeout_at(deadline, operation).await.unwrap_or_else(|_| {
         tracing::info!(

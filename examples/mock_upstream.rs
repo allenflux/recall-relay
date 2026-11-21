@@ -31,6 +31,16 @@ async fn complete(State(auth): State<Arc<str>>, headers: HeaderMap, body: Bytes)
         return error(StatusCode::SERVICE_UNAVAILABLE, "model_not_found");
     }
     let mode = headers.get("x-request-id").and_then(|v| v.to_str().ok());
+    if mode == Some("mock-unknown-400") {
+        return error(StatusCode::BAD_REQUEST, "mock_vendor_error");
+    }
+    if mode == Some("mock-rate-limit") {
+        let mut response = error(StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded");
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, header::HeaderValue::from_static("2"));
+        return response;
+    }
     if matches!(mode, Some("mock-outage-all" | "mock-outage-primary")) {
         return error(StatusCode::SERVICE_UNAVAILABLE, "mock_outage");
     }

@@ -1,5 +1,5 @@
 //! SSE 是按空行划分的事件流。一次网络读取可能只有半行，也可能包含多个事件。
-//! 在首个业务事件前可以换上游，首个业务事件发给客户端后，只能继续转发或结束连接。
+//! 在首个业务事件前可以改用缓存，首个业务事件发给客户端后，只能继续转发或结束连接。
 
 use super::protocol::{self, Fault};
 use axum::body::Bytes;
@@ -31,6 +31,12 @@ fn lines(event: &[u8]) -> impl Iterator<Item = &[u8]> {
         .split(|b| *b == b'\n')
         .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
 }
+fn error_event(event: &[u8]) -> bool {
+    lines(event).any(|line| {
+        line.strip_prefix(b"event:")
+            .is_some_and(|tag| tag.trim_ascii() == b"error")
+    })
+}
 fn data(event: &[u8]) -> Option<Vec<u8>> {
     let fields: Vec<_> = lines(event)
         .filter_map(|line| line.strip_prefix(b"data:").map(<[u8]>::trim_ascii_start))
@@ -51,13 +57,23 @@ fn opening(event: &[u8], reject: bool) -> Result<Opening, Fault> {
         return Ok(Opening::Candidate(String::new(), false, false));
     }
     let raw = data(event).unwrap_or_default();
+    if error_event(event) {
+        // 上游已经用 event: error 声明失败；data 可能是文本，也可能是没有 code 的 JSON。
+        if protocol::terminal_error(&raw) {
+            return Ok(Opening::Forward);
+        }
+        if let Some(v) = protocol::strict_json(&raw) {
+            protocol::embedded_error(&v)?;
+        }
+        return Err(Fault::UpstreamError);
+    }
     if raw.is_empty() || raw == b"[DONE]" {
         return Ok(Opening::Candidate(String::new(), false, raw == b"[DONE]"));
     }
     let Some(v) = protocol::strict_json(&raw) else {
         return Ok(Opening::Forward);
     };
-    if v.get("error").is_some() || v.get("refusal").is_some() {
+    if protocol::has_error(&v) || v.get("refusal").is_some() {
         protocol::embedded_error(&v)?;
         return Ok(Opening::Forward);
     }
@@ -141,26 +157,33 @@ pub(super) async fn first_chunks(
     is_sse: bool,
     limit: usize,
     reject: bool,
-) -> Result<Vec<Bytes>, Fault> {
+) -> Result<(Vec<Bytes>, Option<Fault>), Fault> {
     let mut prelude = Prelude::default();
     while let Some(chunk) = response.chunk().await.map_err(|_| Fault::Transport)? {
         if chunk.is_empty() {
             continue;
         }
         if !is_sse {
-            return Ok(vec![chunk]);
+            return Ok((vec![chunk], None));
         }
         let take = chunk.len().min(limit - prelude.bytes.len());
-        if prelude.feed(&chunk[..take], reject)? {
-            let mut output = vec![Bytes::from(prelude.bytes)];
-            if take < chunk.len() {
-                output.push(chunk.slice(take..));
+        let error = match prelude.feed(&chunk[..take], reject) {
+            Ok(true) => None,
+            Err(fault @ (Fault::UpstreamError | Fault::Temporary(_))) => Some(fault),
+            Err(other) => return Err(other),
+            Ok(false) => {
+                if prelude.bytes.len() >= limit {
+                    return Err(Fault::Protocol);
+                }
+                continue;
             }
-            return Ok(output);
+        };
+        // 即使首个事件是上游错误，这批原始字节也要保留，缓存未命中时可以原样传出。
+        let mut output = vec![Bytes::from(prelude.bytes)];
+        if take < chunk.len() {
+            output.push(chunk.slice(take..));
         }
-        if prelude.bytes.len() >= limit {
-            return Err(Fault::Protocol);
-        }
+        return Ok((output, error));
     }
     Err(Fault::Protocol)
 }
@@ -238,6 +261,9 @@ pub(super) fn history_text(raw: &[u8]) -> Option<(String, Vec<u8>)> {
     let mut start = 0;
     while let Some(sep) = separator(raw, start) {
         let event = &raw[start..sep.start];
+        if error_event(event) {
+            return None;
+        }
         let mut replacement = None;
         if let Some(data) = data(event) {
             if done {
@@ -247,7 +273,8 @@ pub(super) fn history_text(raw: &[u8]) -> Option<(String, Vec<u8>)> {
                 done = true;
             } else {
                 let mut v = protocol::strict_json(&data)?;
-                if v.get("error").is_some() || v.get("refusal").is_some() {
+                if protocol::has_error(&v) || v.get("error").is_some() || v.get("refusal").is_some()
+                {
                     return None;
                 }
                 let choices = v["choices"].as_array()?;
@@ -258,6 +285,8 @@ pub(super) fn history_text(raw: &[u8]) -> Option<(String, Vec<u8>)> {
                     let d = c["delta"].as_object()?;
                     if stopped
                         || !protocol::index_zero(c)
+                        || c.get("error").is_some()
+                        || protocol::truthy(&c["refusal"])
                         || d.keys().any(|k| !matches!(k.as_str(), "role" | "content"))
                         || d.get("role").is_some_and(|r| r != "assistant")
                     {

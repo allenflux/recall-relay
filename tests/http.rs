@@ -17,7 +17,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -183,24 +183,92 @@ async fn passthrough_preserves_wire_target_headers_bytes_and_limits() {
 }
 
 #[tokio::test]
-async fn open_stream_holds_its_slot_and_disconnect_releases_it() {
-    let upstream = serve(Router::new().fallback(reflect)).await;
+async fn open_sse_streams_do_not_limit_chat_or_passthrough() {
+    const STREAMS: usize = 12;
+    const FIRST: &str =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n";
+    const LAST: &str =
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    let (release, gate) = tokio::sync::watch::channel(false);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let upstream = serve(Router::new().fallback({
+        let calls = calls.clone();
+        move |req: Request| {
+            let mut gate = gate.clone();
+            calls.fetch_add(1, Ordering::Relaxed);
+            async move {
+                if req
+                    .headers()
+                    .get("x-request-id")
+                    .is_some_and(|v| v == "limited")
+                {
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [(header::RETRY_AFTER, "9")],
+                        "gateway limit",
+                    )
+                        .into_response();
+                }
+                let body = async_stream::stream! {
+                    yield Ok::<_,std::io::Error>(Bytes::from_static(FIRST.as_bytes()));
+                    gate.wait_for(|&ready| ready).await.unwrap();
+                    yield Ok(Bytes::from_static(LAST.as_bytes()));
+                };
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(body),
+                )
+                    .into_response()
+            }
+        }
+    }))
+    .await;
     let (_relay, addr) = start_relay(&[
-        ("UPSTREAM_ORIGIN", &format!("http://{upstream}")),
-        ("MAX_INFLIGHT", "1"),
+        (
+            "UPSTREAM_URL",
+            &format!("http://{upstream}/v1/chat/completions"),
+        ),
+        ("REDIS_URL", "redis://127.0.0.1:1"),
+        // 老部署保留的配置也不能重新启用本地并发限制或总正文限额。
+        ("MAX_INFLIGHT", "4"),
+        ("MAX_PENDING", "0"),
+        ("MAX_BODY_BYTES", "512"),
+        ("MAX_BUFFERED_BODY_BYTES", "1024"),
     ]);
     let client = client();
-    let url = format!("http://{addr}");
-    let mut stream = client.get(format!("{url}/slow")).send().await.unwrap();
-    assert_eq!(stream.chunk().await.unwrap().unwrap(), "first\n");
-    let busy = client.get(&url).send().await.unwrap();
-    assert_eq!(busy.status(), 429);
-    assert_eq!(busy.headers()[header::RETRY_AFTER], "2");
-    drop(stream);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while client.get(&url).send().await.unwrap().status() != 200 {
-        assert!(Instant::now() < deadline, "下游断开后应释放并发名额");
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    let url = format!("http://{addr}/v1/chat/completions");
+    let payload =
+        json!({"model":"m","messages":[{"role":"user","content":"x".repeat(200)}],"stream":true});
+    let mut held = Vec::new();
+    // 上游一直不发送结束事件。四条聊天 SSE 都在传输时，再交替发起聊天和普通请求。
+    for i in 0..STREAMS {
+        let request = if i < 4 || i % 2 == 0 {
+            client.post(&url).json(&payload)
+        } else {
+            client.get(format!("http://{addr}/stream/{i}"))
+        };
+        let mut response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.chunk().await.unwrap().unwrap(), FIRST);
+        held.push(response);
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), STREAMS);
+
+    // 所有流仍打开时，上游主动限流的下一条请求应收到上游自己的错误信息。
+    let limited = client
+        .post(&url)
+        .header("x-request-id", "limited")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(limited.headers()[header::RETRY_AFTER], "9");
+    assert_eq!(limited.text().await.unwrap(), "gateway limit");
+    assert_eq!(calls.load(Ordering::Relaxed), STREAMS + 1);
+    release.send(true).unwrap();
+    for response in held {
+        assert_eq!(response.text().await.unwrap(), LAST);
     }
 }
 
@@ -284,10 +352,11 @@ async fn history_returns_the_upstream_failure_when_storage_is_unavailable() {
         .await
         .unwrap();
     assert_eq!(slow.chunk().await.unwrap().unwrap(), "first\n");
+    assert_eq!(send().await.unwrap().status(), 503);
     assert_eq!(
-        send().await.unwrap().status(),
-        429,
-        "普通请求和聊天请求共用并发额度"
+        model.calls.load(Ordering::Relaxed),
+        3,
+        "已有普通流时仍立即请求聊天上游"
     );
     let health = client
         .get(format!("http://{addr}/healthz"))
@@ -448,12 +517,12 @@ async fn sulphur_fallback_requires_plugin_header_and_nonstream_request() {
     assert!(sse.headers().get("x-failover-source").is_none());
 }
 
-/// 先把 Python 客户端生成的 Redis 正文、向量和索引装进隔离库，再让主模型对新问题返回 503。
+/// 将原版 Redis 记录装进隔离库，分别模拟可回放错误和必须直接返回的鉴权错误。
 /// 两个问题标点不同，没有新问题的精确记录；只有原生向量命中旧记录才能返回这段回答。
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "需要本机官方 GGUF 和 redis-server"]
-async fn native_replays_legacy_ollama_record_after_503() -> anyhow::Result<()> {
+async fn upstream_errors_use_only_eligible_history() -> anyhow::Result<()> {
     use anyhow::{Context, ensure};
     use base64::{Engine, engine::general_purpose::STANDARD};
     use std::env;
@@ -512,12 +581,55 @@ async fn native_replays_legacy_ollama_record_after_503() -> anyhow::Result<()> {
         .query_async::<()>(&mut db)
         .await?;
 
+    const UNKNOWN: &str =
+        r#"{"error":{"code":"new_vendor_error","detail":"unrecognized upstream failure"}}"#;
+    const DENIED: &str = r#"{"error":{"code":"invalid_api_key","message":"access denied"}}"#;
+    const SSE_OK: &str = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"saved SSE\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    // 每个案例在正式入口发两次，用不同凭据区分能匹配该历史和必须返回原错误的请求。
+    const CASES: &[(&str, u16, &str, bool)] = &[
+        ("unavailable", 503, UNKNOWN, true),
+        ("rate-limit", 429, UNKNOWN, true),
+        ("bad-request", 400, UNKNOWN, true),
+        ("unprocessable", 422, UNKNOWN, true),
+        ("json-error", 200, UNKNOWN, true),
+        ("forbidden", 403, DENIED, false),
+        ("masked-auth", 400, DENIED, false),
+        ("auth-envelope", 200, DENIED, false),
+    ];
+    const TAIL: &str = "data: [DONE]\n\n";
+    let finish_miss = Arc::new(tokio::sync::Notify::new());
+    let tail_gate = finish_miss.clone();
     let calls = Arc::new(AtomicUsize::new(0));
-    let counter = Arc::clone(&calls);
-    let upstream = serve(Router::new().fallback(move || {
-        counter.fetch_add(1, Ordering::Relaxed);
-        async { StatusCode::SERVICE_UNAVAILABLE }
-    }))
+    let counter = calls.clone();
+    let upstream = serve(
+        Router::new().fallback(move |headers: axum::http::HeaderMap| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            let tail_gate = tail_gate.clone();
+            async move {
+                let mode = headers["x-request-id"].to_str().unwrap();
+                if mode == "live-sse" {
+                    return ([(header::CONTENT_TYPE, "text/event-stream")], SSE_OK).into_response();
+                }
+                if matches!(mode, "failed-sse" | "denied-sse") {
+                    let data = if mode == "denied-sse" { DENIED } else { UNKNOWN };
+                    let keep_open = headers[header::AUTHORIZATION] == "Bearer different-tenant";
+                    let body = async_stream::stream! {
+                        yield Ok::<_,std::io::Error>(Bytes::from(format!("event: error\ndata: {data}\n\n")));
+                        if keep_open { tail_gate.notified().await; }
+                        yield Ok(Bytes::from_static(TAIL.as_bytes()));
+                    };
+                    return ([(header::CONTENT_TYPE,"text/event-stream")],Body::from_stream(body)).into_response();
+                }
+                let (_, code, body, _) = CASES.iter().find(|(name, ..)| *name == mode).unwrap();
+                (
+                    StatusCode::from_u16(*code).unwrap(),
+                    [(header::CONTENT_TYPE, "application/json")],
+                    *body,
+                )
+                    .into_response()
+            }
+        }),
+    )
     .await;
     let upstream_url = format!("http://{upstream}/v1/chat/completions");
     let explicit = env::var("HISTORY_EMBEDDING_MODEL_PATH").unwrap_or_default();
@@ -541,33 +653,92 @@ async fn native_replays_legacy_ollama_record_after_503() -> anyhow::Result<()> {
     let (_relay, addr) = start_relay(&settings);
     let client = client();
     let url = format!("http://{addr}/v1/chat/completions");
-    // 应用在就绪前已完成预热，第一笔实际故障就应成功回放。
-    let response = client
-        .post(&url)
-        .bearer_auth("compat-fixture")
-        .header(header::ACCEPT, "application/json")
-        .json(&legacy["request"])
-        .send()
-        .await?;
-    ensure!(calls.load(Ordering::Relaxed) == 1, "应先请求主模型一次");
-    ensure!(
-        response.status() == 200,
-        "向量回放失败，状态 {}",
-        response.status()
-    );
-    ensure!(
-        response.headers()["x-failover-source"] == "history",
-        "回答并非历史命中"
-    );
-    let body = response.bytes().await?;
     let split = record
         .iter()
         .position(|&b| b == b'\n')
         .context("历史记录缺少分隔符")?;
+    let send = |mode: &str, token: &str, request: &Value| {
+        client
+            .post(&url)
+            .bearer_auth(token)
+            .header("x-request-id", mode)
+            .header(header::ACCEPT, "application/json")
+            .json(request)
+            .send()
+    };
+    for &(mode, status, original, can_replay) in CASES {
+        for token in ["compat-fixture", "different-tenant"] {
+            let response = send(mode, token, &legacy["request"]).await?;
+            if can_replay && token == "compat-fixture" {
+                ensure!(response.status() == 200, "{mode} 应回放成功");
+                ensure!(
+                    response
+                        .headers()
+                        .get("x-failover-source")
+                        .is_some_and(|v| v == "history"),
+                    "{mode} 未命中旧向量"
+                );
+                ensure!(
+                    response.bytes().await?.as_ref() == &record[split + 1..],
+                    "{mode} 的回放正文有变化"
+                );
+            } else {
+                ensure!(
+                    response.status().as_u16() == status,
+                    "{mode} 应保留上游状态"
+                );
+                ensure!(
+                    !response.headers().contains_key("x-failover-source"),
+                    "{mode} 意外回放"
+                );
+                ensure!(
+                    response.text().await? == original,
+                    "{mode} 应保留上游错误正文"
+                );
+            }
+        }
+    }
     ensure!(
-        body.as_ref() == &record[split + 1..],
-        "返回的正文与旧记录不同"
+        calls.load(Ordering::Relaxed) == CASES.len() * 2,
+        "每次应先访问上游一次"
     );
+
+    // SSE 的首个事件就是新供应商的错误时，也要在提交下游响应头之前尝试回放。
+    let stream =
+        json!({"model":"sse","stream":true,"messages":[{"role":"user","content":"hello"}]});
+    let live = send("live-sse", "sse-tenant", &stream).await?;
+    ensure!(live.status() == 200 && !live.headers().contains_key("x-failover-source"));
+    ensure!(live.text().await? == SSE_OK);
+    // 正常回答异步写入。只在尚未写入时重试，超时会使测试失败。
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let reply = send("failed-sse", "sse-tenant", &stream).await?;
+            if reply
+                .headers()
+                .get("x-failover-source")
+                .is_some_and(|v| v == "history")
+            {
+                ensure!(reply.status() == 200, "SSE 首事件错误时应回放");
+                ensure!(reply.text().await?.contains("saved SSE"));
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    // 换租户后应原样收到首个错误和后续事件。分开发送还能检查转发过程中是否丢帧。
+    let mut miss = send("failed-sse", "different-tenant", &stream).await?;
+    ensure!(miss.status() == 200 && !miss.headers().contains_key("x-failover-source"));
+    ensure!(miss.headers()[header::CONTENT_TYPE] == "text/event-stream");
+    ensure!(
+        miss.chunk().await?.context("缺少 SSE 错误首帧")?
+            == format!("event: error\ndata: {UNKNOWN}\n\n")
+    );
+    finish_miss.notify_one();
+    ensure!(miss.text().await? == TAIL);
+    let sensitive = send("denied-sse", "sse-tenant", &stream).await?;
+    ensure!(sensitive.status() == 200 && !sensitive.headers().contains_key("x-failover-source"));
+    ensure!(sensitive.text().await? == format!("event: error\ndata: {DENIED}\n\n{TAIL}"));
     Ok(())
 }
 

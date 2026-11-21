@@ -83,23 +83,25 @@ curl -si http://127.0.0.1:8000/v1/chat/completions \
 | 1 | [src/main.rs](src/main.rs) | 找到唯一的 `TcpListener::bind`。看 `.await` 如何等待服务，以及 `?` 如何将启动错误交回调用者。 |
 | 2 | [src/lib.rs](src/lib.rs) | 从 `dispatch` 读起。健康检查就地返回，启用历史的聊天请求交给聊天处理器，普通请求交给转发器。 |
 | 3 | [src/passthrough.rs](src/passthrough.rs) | 在 `forward` 里跟着一条请求看 method、原始路径、查询串、请求头和字节如何发往固定主机。 |
-| 4 | [src/relay/mod.rs](src/relay/mod.rs) | `handle` 负责排队和解析，`conversation` 先请求上游，遇到可降级的故障才查缓存。 |
+| 4 | [src/relay/mod.rs](src/relay/mod.rs) | `handle` 负责解析请求，`conversation` 先请求上游，遇到可降级的故障才查缓存。 |
 | 5 | [src/history/identity.rs](src/history/identity.rs) 与 [src/history/mod.rs](src/history/mod.rs) | `canonicalize` 借用请求，生成用于查找记录的指纹。`enqueue` 把可保存的回答交给后台，`lookup` 负责故障时取回。 |
 | 6 | [src/relay/sse.rs](src/relay/sse.rs) 与 [src/delivery.rs](src/delivery.rs) | 观察上游分块、SSE 事件和下游写入之间的区别。一个事件可能横跨多个网络分块。 |
 
-第一次读可以只走前三步。遇到 `Arc::clone`，看它包住的是哪个共享对象，例如连接池或信号量。遇到并发许可，找它最后被移到了哪里。Relay 已经发出响应头的时候，SSE 可能还在输出，因此许可跟着发送任务走，到结束、超时或断开时自动归还。
+第一次读可以只走前三步。遇到 `Arc::clone`，看它包住的是哪个共享对象，例如上游连接池。Relay 发出响应头后，SSE 还可能持续输出；跟着转发任务可以看到流如何在结束、超时或断开时释放上游连接。
 
 ## 聊天请求的处理顺序
 
-每次先尝试客户端指定的主模型。单个非空 `Authorization`、可确定身份的请求及通过校验的完整上游回答，才具备历史读写条件。主模型鉴权失败会直接返回。如果主模型超时、限流、服务不可用或返回符合降级条件的空回答，Relay 在提交下游响应前依次尝试以下来源。
+每次先请求客户端指定的主模型。历史记录按凭据和请求范围隔离，只有带单个非空 `Authorization`、可确定身份的请求才参与读写。缓存只保存通过校验的完整上游回答。
+
+上游超时、限流、服务故障或返回原因未知的错误（包括 HTTP 400、422）时，Relay 在向客户端发送回答前查询缓存。即使 HTTP 状态是 200，JSON 正文或 SSE 首个事件中出现的上游错误也按相同规则处理。遇到明确的鉴权失败、权限不足、内容政策拒绝或模型不存在时，Relay 直接转发上游响应。
 
 | 来源 | 条件与行为 |
 | --- | --- |
 | 精确历史 | 先查 Redis，再查可选的 MySQL。回放前再次校验保存的 JSON 或 SSE。 |
 | 近似历史 | 单张内联图片可按相同范围和已识别的意图匹配。启用向量后，由 Rust 进程内的 EmbeddingGemma 生成提问向量，按配置阈值匹配。 |
-| Sulphur 提示词 | 对符合条件的 ComfyUI Sulphur 非流式优化请求，可返回本次请求中的用户提示词，标记为 `prompt`。其余请求返回相应的可重试错误。 |
+| Sulphur 提示词 | 缓存未命中时，符合条件的 ComfyUI Sulphur 非流式优化请求可返回用户原提示词，标记为 `prompt`。 |
 
-流式响应已经开始传输后，上游中断会终止当前响应。缓存未命中时，普通聊天返回错误。
+普通聊天命中缓存时返回历史回答，并带 `X-Failover-Source: history`。未命中时返回相应的错误。SSE 已开始传输后，上游中断会终止当前响应。
 
 ## 常用配置
 
@@ -109,7 +111,7 @@ curl -si http://127.0.0.1:8000/v1/chat/completions \
 | `RELAY_BIND` | 唯一监听地址，默认 `127.0.0.1:8000`。反向代理后的外部入口可另用 `INGRESS_ORIGIN` 声明，以检查转发环路。 |
 | `REDIS_URL`、`REDIS_PREFIX`、`POLICY_EPOCH` | Redis 地址、历史命名空间和策略版本。与 Python 版共享既有记录时，使用原部署的前缀和策略值。 |
 | `REQUEST_PATH` | 对客户端提供的聊天路径，默认 `/v1/chat/completions`。健康检查为 `/healthz`。上游使用标准聊天路径后缀时，可通过 `GET /v1/models` 查询对应模型列表。 |
-| `MAX_INFLIGHT`、`MAX_BODY_BYTES` | 全服务共用的活跃请求上限，默认 16。单次请求体上限默认 10 MiB。聊天还支持 `MAX_PENDING`、`QUEUE_TIMEOUT_SECONDS` 和 `MAX_BUFFERED_BODY_BYTES`。 |
+| `MAX_BODY_BYTES` | 单个请求体的大小上限，默认 10 MiB，聊天和通用透传均适用。 |
 | `TOTAL_TIMEOUT_SECONDS`、`STREAM_TIMEOUT_SECONDS` | 默认请求总预算 60 秒。启用历史后，已经提交的聊天流有独立预算，默认 600 秒。非流式、SSE 启动和 Sulphur 的细分预算见 [src/config.rs](src/config.rs)。 |
 | `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` | 配置长期存储。Redis 热缓存默认保留 24 小时、最多 1024 条。MySQL 命中后会回填 Redis。 |
 | `HISTORY_NEAR_MODE`、`HISTORY_EMBEDDING_MODE` | 可选 `off`、`shadow` 或 `replay`。`shadow` 只观察近似命中。默认启用规则匹配，关闭嵌入。 |

@@ -91,7 +91,6 @@ fn origin(raw: &str, name: &str) -> Result<Url> {
 pub struct ProxyConfig {
     pub origin: axum::http::Uri,
     pub max_body: usize,
-    pub max_inflight: usize,
     pub total_timeout: Duration,
 }
 
@@ -101,7 +100,6 @@ impl ProxyConfig {
             upstream,
             ingress,
             number("MAX_BODY_BYTES", 10 * 1024 * 1024)?,
-            number("MAX_INFLIGHT", 16)?,
             time("TOTAL_TIMEOUT_SECONDS", 60)?,
         )
     }
@@ -110,7 +108,6 @@ impl ProxyConfig {
         upstream: &str,
         ingress: &str,
         max_body: usize,
-        max_inflight: usize,
         total_timeout: Duration,
     ) -> Result<Self> {
         let upstream = origin(upstream, "UPSTREAM_ORIGIN")?;
@@ -119,10 +116,7 @@ impl ProxyConfig {
             upstream.origin() != ingress.origin(),
             "上游和中继入口相同，会形成循环"
         );
-        ensure!(
-            max_body > 0 && (1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&max_inflight),
-            "请求体和并发上限无效"
-        );
+        ensure!(max_body > 0, "MAX_BODY_BYTES 必须大于 0");
         ensure!(
             (Duration::from_millis(50)..=Duration::from_secs(60)).contains(&total_timeout),
             "TOTAL_TIMEOUT_SECONDS 应在 0.05 到 60 之间"
@@ -130,7 +124,6 @@ impl ProxyConfig {
         Ok(Self {
             origin: upstream.as_str().parse()?,
             max_body,
-            max_inflight,
             total_timeout,
         })
     }
@@ -217,12 +210,8 @@ pub struct RelayConfig {
     pub max_body: usize,
     pub max_response: usize,
     pub max_ingest: usize,
-    pub max_inflight: usize,
     pub retry_after: usize,
     pub stream_timeout: Duration,
-    pub max_pending: usize,
-    pub queue_timeout: Duration,
-    pub max_buffered_body: usize,
     pub nonstream_total_timeout: Option<Duration>,
     pub nonstream_upstream_timeout: Option<Duration>,
     pub reject_empty_json: bool,
@@ -241,14 +230,10 @@ impl RelayConfig {
             total_timeout: time("TOTAL_TIMEOUT_SECONDS", 60)?,
             upstream_timeout: time("UPSTREAM_TIMEOUT_SECONDS", 55)?,
             fallback_budget,
-            max_body: number("MAX_BODY_BYTES", 10 * 1024 * 1024)?,
+            max_body: routes.proxy.max_body,
             max_response: 2 * 1024 * 1024,
             max_ingest: 256 * 1024,
             retry_after: 2,
-            max_inflight: number("MAX_INFLIGHT", 16)?,
-            max_pending: number("MAX_PENDING", 0)?,
-            queue_timeout: time("QUEUE_TIMEOUT_SECONDS", 15)?,
-            max_buffered_body: number("MAX_BUFFERED_BODY_BYTES", 64 * 1024 * 1024)?,
             stream_timeout: time("STREAM_TIMEOUT_SECONDS", 600)?,
             nonstream_total_timeout: optional_time("NONSTREAM_TOTAL_TIMEOUT_SECONDS")?,
             nonstream_upstream_timeout: optional_time("NONSTREAM_UPSTREAM_TIMEOUT_SECONDS")?,
@@ -298,35 +283,19 @@ impl RelayConfig {
             !self.policy.is_empty() && self.request_path.starts_with('/'),
             "策略或请求路径无效"
         );
-        let max_permits = tokio::sync::Semaphore::MAX_PERMITS;
-        ensure!(
-            (1..=max_permits).contains(&self.max_inflight)
-                && self.max_pending <= max_permits
-                && self.max_body > 0
-                && self.max_buffered_body >= self.max_body,
-            "并发数或请求体上限无效"
-        );
         let minute = Duration::from_secs(60);
         let minimum = Duration::from_millis(50);
         let ceiling = Duration::from_secs(6000);
         ensure!(
             (minimum..=minute).contains(&self.total_timeout)
-                && (minimum..=ceiling).contains(&self.stream_timeout)
-                && !self.queue_timeout.is_zero()
-                && self.queue_timeout <= minute,
-            "总预算、流式或排队超时无效"
+                && (minimum..=ceiling).contains(&self.stream_timeout),
+            "总预算或流式超时无效"
         );
         for (streaming, sulphur) in [(true, false), (false, false), (false, true)] {
             let custom_sulphur = sulphur
                 && (self.sulphur_nonstream_total_timeout.is_some()
                     || self.sulphur_nonstream_upstream_timeout.is_some());
-            let limit = if custom_sulphur && self.max_pending > 0 {
-                minute - self.queue_timeout
-            } else if custom_sulphur {
-                minute
-            } else {
-                ceiling
-            };
+            let limit = if custom_sulphur { minute } else { ceiling };
             let (total, primary) = self.timeouts(streaming, sulphur);
             ensure!(
                 total >= minimum
@@ -348,7 +317,7 @@ mod tests {
     #[test]
     fn proxy_validates_origin_and_deadline() {
         let build = |upstream: &str, ingress: &str| {
-            ProxyConfig::new(upstream, ingress, 10, 1, Duration::from_secs(1))
+            ProxyConfig::new(upstream, ingress, 10, Duration::from_secs(1))
         };
         assert!(build("https://example.org", "https://EXAMPLE.org:443").is_err());
         for invalid in [

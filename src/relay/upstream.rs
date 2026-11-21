@@ -135,66 +135,72 @@ impl Turn {
             let challenge = upstream.headers().get("www-authenticate").cloned();
             let finish = |body: Body| {
                 let mut response = reply(code, body, ty.clone(), None);
-                if code >= 400 {
-                    if let Some(value) = &retry {
-                        response.headers_mut().insert("retry-after", value.clone());
-                    }
-                    if let Some(value) = &challenge {
-                        response
-                            .headers_mut()
-                            .insert("www-authenticate", value.clone());
-                    }
+                // 厂商也可能用 HTTP 200 包装错误，这两个上游提示头跟随原响应。
+                if let Some(value) = &retry {
+                    response.headers_mut().insert("retry-after", value.clone());
+                }
+                if let Some(value) = &challenge {
+                    response
+                        .headers_mut()
+                        .insert("www-authenticate", value.clone());
                 }
                 response
             };
             let limit = self.relay.c.max_response;
 
-            if code == 408 || code == 429 || code >= 500 {
-                failure_status = code;
-                let body = read_bounded(upstream, limit.min(64 * 1024)).await?;
-                if protocol::model_not_found(&body) {
-                    reason = "model_not_found";
-                    self.relay.count("terminal_model_not_found");
+            if code != 200 {
+                // 这些状态已经明确表示端点、鉴权或策略问题，即使读取正文失败也直接返回。
+                if code < 400 || matches!(code, 401 | 403 | 404 | 407 | 451) {
+                    terminal = Some(code);
+                } else {
+                    failure_status = code;
+                }
+                let error_limit = if matches!(code, 408 | 429) || code >= 500 {
+                    limit.min(64 * 1024)
+                } else {
+                    limit
+                };
+                let body = read_bounded(upstream, error_limit).await?;
+                if terminal.is_some() || protocol::terminal_error(&body) {
+                    reason = "terminal_upstream_response";
                     return Ok(Some(finish(Body::from(body))));
+                }
+                // 未知错误和已知能力限制都查缓存，分类仅用于记录故障原因。
+                if code == 400
+                    && let Some((kind, _)) = protocol::capability_failure(&body)
+                {
+                    reason = kind;
                 }
                 upstream_error = Some(finish(Body::from(body)));
                 return Ok(None);
             }
-            if code != 200 {
-                // 已收到授权失败等业务状态。读取错误正文中断也不能转成历史回放。
-                terminal = Some(code);
-                let body = read_bounded(upstream, limit).await?;
-                if code == 400
-                    && let Some((kind, _)) = protocol::capability_failure(&body)
-                {
-                    terminal = None;
-                    failure_status = code;
-                    reason = kind;
-                    upstream_error = Some(finish(Body::from(body)));
-                    return Ok(None);
-                }
-                return Ok(Some(finish(Body::from(body))));
-            }
             let replayable_format = protocol::replay_format(&self.request).is_some();
-            if self.streaming && is_json && replayable_format {
+            if !self.streaming || (is_json && replayable_format) {
                 let body = read_bounded(upstream, limit).await?;
-                if let Some(v) = protocol::strict_json(&body) {
-                    protocol::embedded_error(&v)?;
-                }
-                return Ok(Some(finish(Body::from(body))));
-            }
-            let can_store = self.identity.is_some();
-            if !self.streaming {
-                let body = read_bounded(upstream, limit).await?;
-                let capture = if can_store && is_json {
+                let capture = if !self.streaming && self.identity.is_some() && is_json {
                     protocol::prepare_history(&body, &self.request, false, self.reject)
                 } else {
                     None
                 };
                 if capture.is_none() && replayable_format {
-                    protocol::validate_live(&body, self.reject).inspect_err(|_| {
+                    let validation = if self.streaming {
+                        protocol::strict_json(&body)
+                            .as_ref()
+                            .map_or(Ok(()), protocol::embedded_error)
+                    } else {
+                        protocol::validate_live(&body, self.reject)
+                    };
+                    if let Err(fault) = validation {
                         self.relay.count("ingest_invalid");
-                    })?;
+                        if matches!(fault, Fault::Temporary(_) | Fault::UpstreamError) {
+                            // 某些网关通过 HTTP 200 返回 JSON 错误。缓存未命中时原样交给客户端。
+                            upstream_error = Some(finish(Body::from(body)));
+                        }
+                        return Err(fault);
+                    }
+                }
+                if self.streaming {
+                    return Ok(Some(finish(Body::from(body))));
                 }
                 let turn = self.clone();
                 // 生成器先交付正文，再入队。客户端提前断开会丢弃生成器。
@@ -208,17 +214,25 @@ impl Turn {
                 };
                 return Ok(Some(finish(Body::from_stream(output))));
             }
-            let first = sse::first_chunks(&mut upstream, is_sse, limit, self.reject).await?;
-            let output = self.streaming_body(upstream, first, is_sse, allowance, cutoff);
-            let mut response = finish(output);
-            response.extensions_mut().insert(crate::delivery::Limits {
+            let (first, opening_error) =
+                sse::first_chunks(&mut upstream, is_sse, limit, self.reject).await?;
+            let limits = crate::delivery::Limits {
                 wall: if is_sse {
                     Instant::now() + self.relay.c.stream_timeout
                 } else {
                     cutoff
                 },
                 idle: is_sse.then_some(allowance),
-            });
+            };
+            let output =
+                self.streaming_body(upstream, first, limits, is_sse && opening_error.is_none());
+            let mut response = finish(output);
+            response.extensions_mut().insert(limits);
+            if let Some(fault) = opening_error {
+                // 保留首个事件和其余流。若查到历史，丢弃这个响应也会关闭对原上游的读取。
+                upstream_error = Some(response);
+                return Err(fault);
+            }
             Ok(Some(response))
         })
         .await
@@ -268,10 +282,10 @@ impl Turn {
                 false,
                 retry_after,
             )),
-            Some(_) => UpstreamOutcome::Forward(error(
-                503,
+            Some(code) => UpstreamOutcome::Forward(error(
+                if code >= 400 { code } else { 503 },
                 "upstream_error_response_interrupted",
-                true,
+                code < 400,
                 retry_after,
             )),
             None => UpstreamOutcome::CheckHistory(upstream_error.unwrap_or_else(|| {
@@ -289,26 +303,20 @@ impl Turn {
         self: &Arc<Self>,
         mut upstream: reqwest::Response,
         first: Vec<Bytes>,
-        is_sse: bool,
-        idle: Duration,
-        initial_cutoff: Instant,
+        limits: crate::delivery::Limits,
+        check_completion: bool,
     ) -> Body {
         let turn = self.clone();
-        let c = &turn.relay.c;
-        let wall = if is_sse {
-            Instant::now() + c.stream_timeout
-        } else {
-            initial_cutoff
+        let can_store = self.identity.is_some() && check_completion;
+        let next_cutoff = move || {
+            limits
+                .idle
+                .map_or(limits.wall, |idle| limits.wall.min(Instant::now() + idle))
         };
-        let can_store = self.identity.is_some();
-        let mut cutoff = if is_sse {
-            wall.min(Instant::now() + idle)
-        } else {
-            wall
-        };
+        let mut cutoff = next_cutoff();
         let stream = async_stream::try_stream! {
             let mut tracker = sse::Completion::default();
-            let mut capture = (can_store && is_sse).then(Vec::new);
+            let mut capture = can_store.then(Vec::new);
             let mut initial = first.into_iter();
             loop {
                 let next = if let Some(first) = initial.next() {
@@ -323,9 +331,9 @@ impl Turn {
                 if chunk.is_empty() {
                     continue;
                 }
-                if is_sse {
+                cutoff = next_cutoff();
+                if check_completion {
                     tracker.feed(&chunk, turn.relay.c.max_response);
-                    cutoff = wall.min(Instant::now() + idle);
                 }
                 if let Some(body) = capture.as_mut() {
                     if body.len() + chunk.len() <= turn.relay.c.max_ingest {
@@ -338,7 +346,7 @@ impl Turn {
                 // yield 会把控制权交回 HTTP 层；下游准备好之前不会拉取下一块上游数据。
                 yield chunk;
             }
-            if is_sse && tracker.incomplete() {
+            if check_completion && tracker.incomplete() {
                 Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete upstream OpenAI SSE"))?;
             }
             if let (Some(identity), Some(captured)) = (&turn.identity, capture)

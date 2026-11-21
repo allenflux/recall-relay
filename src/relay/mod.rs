@@ -24,16 +24,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
-    time::{Instant, timeout, timeout_at},
-};
+use tokio::time::{Instant, timeout, timeout_at};
 use upstream::UpstreamOutcome;
 use uuid::Uuid;
 
@@ -43,27 +37,16 @@ pub struct Relay {
     models_url: Option<Url>,
     history: Arc<History>,
     client: reqwest::Client,
-    slots: Arc<Semaphore>,
-    waiting: Arc<Semaphore>,
-    buffered: Arc<AtomicUsize>,
     counters: Mutex<HashMap<String, u64>>,
 }
 
 impl Relay {
-    pub fn with_slots(
-        config: RelayConfig,
-        history: Arc<History>,
-        client: reqwest::Client,
-        slots: Arc<Semaphore>,
-    ) -> Self {
+    pub fn new(config: RelayConfig, history: Arc<History>, client: reqwest::Client) -> Self {
         let upstream = Url::parse(&config.upstream_url).expect("URL checked at startup");
         let models_url = crate::config::models_url(&upstream);
         Self {
             upstream,
             models_url,
-            slots,
-            waiting: Arc::new(Semaphore::new(config.max_pending)),
-            buffered: Arc::new(AtomicUsize::new(0)),
             counters: Mutex::default(),
             c: config,
             history,
@@ -79,17 +62,6 @@ impl Relay {
         let count = counters.entry(name.to_owned()).or_default();
         *count += 1;
         tracing::debug!(metric = name, count = *count, "relay_metric");
-    }
-    async fn acquire(&self) -> Option<OwnedSemaphorePermit> {
-        if let Ok(slot) = self.slots.clone().try_acquire_owned() {
-            return Some(slot);
-        }
-        // 排队时还没有读取请求体，等待者最多占用一个队列名额。离开作用域自动归还。
-        let _pending = self.waiting.clone().try_acquire_owned().ok()?;
-        timeout(self.c.queue_timeout, self.slots.clone().acquire_owned())
-            .await
-            .ok()?
-            .ok()
     }
 }
 
@@ -121,34 +93,6 @@ fn error(code: u16, reason: &str, retry: bool, after: usize) -> Response {
         );
     }
     response
-}
-
-/// 只要请求还活着，它申请过的正文空间就由这个对象负责归还。超时、return、客户端断开
-/// 都会触发 Drop，无需在每条错误路径手动减计数。
-struct Budget {
-    buffered: Arc<AtomicUsize>,
-    bytes: usize,
-    _slot: OwnedSemaphorePermit,
-}
-impl Budget {
-    fn charge(&mut self, size: usize, limit: usize) -> bool {
-        if self
-            .buffered
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                n.checked_add(size).filter(|sum| *sum <= limit)
-            })
-            .is_err()
-        {
-            return false;
-        }
-        self.bytes += size;
-        true
-    }
-}
-impl Drop for Budget {
-    fn drop(&mut self) {
-        self.buffered.fetch_sub(self.bytes, Ordering::Relaxed);
-    }
 }
 
 fn append_query(mut url: Url, query: &str) -> Url {
@@ -271,15 +215,6 @@ pub(crate) async fn handle(relay: Arc<Relay>, request: Request, path: String) ->
     if parts.method != method {
         return error(405, "method_not_allowed", false, c.retry_after);
     }
-    let Some(slot) = relay.acquire().await else {
-        relay.count("local_rejected");
-        return error(429, "local_capacity", true, c.retry_after);
-    };
-    let mut budget = Budget {
-        buffered: relay.buffered.clone(),
-        bytes: 0,
-        _slot: slot,
-    };
     let started = Instant::now();
     // POST 是聊天请求的方法，SSE 由请求体的 stream 选择。
     // 只有声明 Sulphur 标识的客户端才采用插件预算和提示词兜底。
@@ -307,7 +242,7 @@ pub(crate) async fn handle(relay: Arc<Relay>, request: Request, path: String) ->
         )
         .await
         .unwrap_or_else(|_| error(503, "request_deadline", true, c.retry_after));
-        return delivery::bounded(result, budget, initial_deadline);
+        return delivery::bounded(result, initial_deadline);
     }
 
     let upload = async {
@@ -317,10 +252,6 @@ pub(crate) async fn handle(relay: Arc<Relay>, request: Request, path: String) ->
             let chunk = chunk.map_err(|_| error(400, "invalid_request", false, c.retry_after))?;
             if chunk.len() > c.max_body - raw.len() {
                 return Err(error(413, "request_too_large", false, c.retry_after));
-            }
-            if !budget.charge(chunk.len(), c.max_buffered_body) {
-                relay.count("local_body_rejected");
-                return Err(error(429, "local_body_capacity", true, c.retry_after));
             }
             raw.extend_from_slice(&chunk);
         }
@@ -367,7 +298,7 @@ pub(crate) async fn handle(relay: Arc<Relay>, request: Request, path: String) ->
     )
     .await
     .unwrap_or_else(|_| error(503, "request_deadline", true, c.retry_after));
-    delivery::bounded(response, budget, deadline)
+    delivery::bounded(response, deadline)
 }
 
 struct RequestInfo<'a> {

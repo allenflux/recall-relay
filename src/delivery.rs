@@ -1,5 +1,5 @@
-//! 把并发许可交给独立转发任务。即使下游 TCP 缓冲区写满、HTTP 层停止轮询 Body，
-//! 计时器仍在 Tokio 上运行，到期会释放上游连接、并发许可和请求体额度。
+//! 独立任务把上游响应逐块送给客户端。即使下游 TCP 缓冲区写满、HTTP 层停止读取正文，
+//! 计时器仍能在超时后主动关闭上游响应。
 
 use axum::{
     body::{Body, Bytes},
@@ -18,11 +18,7 @@ pub(crate) struct Limits {
     pub idle: Option<Duration>,
 }
 
-pub(crate) fn bounded<T: Send + 'static>(
-    response: Response,
-    resource: T,
-    default_deadline: Instant,
-) -> Response {
+pub(crate) fn bounded(response: Response, default_deadline: Instant) -> Response {
     let (mut head, body) = response.into_parts();
     let limits = head.extensions.remove::<Limits>().unwrap_or(Limits {
         wall: default_deadline,
@@ -31,7 +27,6 @@ pub(crate) fn bounded<T: Send + 'static>(
     let (sender, mut receiver) = mpsc::channel::<(Bytes, oneshot::Sender<()>)>(1);
     let (finished, outcome) = oneshot::channel();
     tokio::spawn(async move {
-        let _resource = resource;
         let pump = async {
             let mut chunks = body.into_data_stream();
             while let Some(chunk) = chunks.next().await {

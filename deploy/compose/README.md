@@ -14,9 +14,11 @@ docker compose ps
 curl -fsS http://127.0.0.1:8000/healthz
 ```
 
-`UPSTREAM_URL` 指定唯一上游。普通聊天请求先发往该地址，成功回答通过校验后写入历史。上游遇到可回放故障时，Relay 查询缓存，命中就返回历史回答，未命中就返回错误。请求和响应正文默认各预览最多 2048 个原始字节，可将 `RELAY_LOG_CONTENT=false` 写入环境文件关闭正文日志。
+`UPSTREAM_URL` 指定唯一上游。并发到达的有效请求直接转给上游，缓存只保存通过校验的完整回答。请求和响应正文默认各预览最多 2048 个原始字节，可将 `RELAY_LOG_CONTENT=false` 写入环境文件关闭正文日志。
 
 `RELAY_PORT` 控制宿主机发布端口。客户端将原来的网关基础地址改为 Relay 入口，保留自己的凭据和请求体中的模型 ID。Relay 把客户端的 Authorization 转给固定网关，并按凭据隔离历史记录。
+
+聊天上游返回 429、5xx 或原因未知的 HTTP 400 时，Relay 先查缓存。命中返回历史回答，普通聊天未命中则返回错误。明确的鉴权、权限、内容政策或模型不存在错误直接返回。SSE 已开始传输后遇到故障，当前流会结束。
 
 ```sh
 curl -fsSN http://127.0.0.1:8000/v1/chat/completions \
@@ -74,7 +76,7 @@ docker compose --env-file .env.compose.mock -p recall-relay-mock \
 用同一组 Bearer 凭据按顺序检查三种结果：
 
 1. 以 `mock-primary` 发送普通文本聊天请求，预期收到 200 和模拟网关回答。等待异步写入完成。
-2. 保持同一请求体和凭据，加上 `X-Request-ID: mock-outage-all` 模拟上游故障。预期仍是 200，带 `X-Failover-Source: history`，正文与第一步一致。
-3. 保持故障标记，将问题改为此前未请求过的新文本。预期上游故障后查不到缓存，Relay 返回错误。这个 503 故障示例返回 HTTP 503。
+2. 保持同一请求体和凭据，加上 `X-Request-ID: mock-rate-limit` 模拟上游 429，`mock-unknown-400` 模拟未知 400，`mock-outage-all` 模拟 503。预期仍是 200，带 `X-Failover-Source: history`，正文与第一步一致。
+3. 保持故障标记，将问题改为没有匹配历史的普通聊天请求。预期收到模拟上游对应的 400、429 或 503。429 响应会保留上游的 `Retry-After`。
 
 可用 `docker compose --env-file .env.compose.mock -p recall-relay-mock -f compose.yaml -f deploy/compose/mock.yaml down` 停止测试项目并保留命名卷。

@@ -20,7 +20,6 @@ use axum::{
     http::{StatusCode, Uri, uri::PathAndQuery},
     response::{IntoResponse, Response},
 };
-use tokio::sync::Semaphore;
 use url::{Position, Url};
 
 use config::{RelayConfig, Routes, setting};
@@ -55,7 +54,6 @@ impl Application {
     /// 嵌入已有服务时，可传入使用自定义审核回调的历史库；HTTP 仍只注册一个路由入口。
     pub fn with_history(listener: SocketAddr, history: Option<Arc<History>>) -> Result<Self> {
         let routes = Routes::from_env(listener)?;
-        let slots = Arc::new(Semaphore::new(routes.proxy.max_inflight));
         let chat = match &history {
             Some(store) => {
                 let config = RelayConfig::from_env(&routes, store.fallback_budget())?;
@@ -63,15 +61,8 @@ impl Application {
                     .no_proxy()
                     .redirect(reqwest::redirect::Policy::none())
                     .retry(reqwest::retry::never())
-                    .pool_max_idle_per_host(config.max_inflight)
                     .build()?;
-                // 两类请求共用一个信号量，MAX_INFLIGHT 限制整个服务的活跃请求总数。
-                Some(Arc::new(Relay::with_slots(
-                    config,
-                    Arc::clone(store),
-                    client,
-                    Arc::clone(&slots),
-                )))
+                Some(Arc::new(Relay::new(config, Arc::clone(store), client)))
             }
             None => None,
         };
@@ -93,7 +84,7 @@ impl Application {
             map("/v1/models", &models)?;
         }
         let state = Arc::new(Service {
-            proxy: Proxy::new(routes.proxy, slots),
+            proxy: Proxy::new(routes.proxy),
             chat,
             rewrites,
         });

@@ -42,7 +42,7 @@ fn terminal_failures_never_become_history() {
         protocol::capability_failure(b"At most 0 image(s) may be provided in one prompt."),
         Some(("modality_limit", 503))
     );
-    assert!(protocol::model_not_found(
+    assert!(protocol::terminal_error(
         br#"{"error":{"type":"MODEL_NOT_FOUND"}}"#
     ));
     assert!(protocol::validate_live(br#"{"error":{"type":"authentication_error"}}"#, true).is_ok());
@@ -50,6 +50,19 @@ fn terminal_failures_never_become_history() {
         protocol::validate_live(br#"{"error":{"type":"rate_limit_error"}}"#, true),
         Err(protocol::Fault::Temporary(429))
     );
+}
+#[test]
+fn unknown_error_envelopes_never_enter_history() {
+    let request = json!({"model":"m"});
+    let tagged = br#"{"type":"error","error":{"code":"vendor_specific"},"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"bad"}}]}"#;
+    assert_eq!(
+        protocol::validate_live(tagged, false),
+        Err(protocol::Fault::UpstreamError)
+    );
+    assert!(prepare_history(tagged, &request, false, false).is_none());
+
+    let stream = b"event: error\ndata: {\"choices\":[{\"delta\":{\"content\":\"bad\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+    assert!(prepare_history(stream, &request, true, false).is_none());
 }
 #[test]
 fn empty_marker_respects_json_case_and_terminal_finish() {
@@ -92,18 +105,20 @@ fn sulphur_returns_user_text_or_numbered_references() {
     );
 }
 #[tokio::test]
-async fn unpolled_downstream_releases_capacity_at_deadline() {
-    let slots = Arc::new(Semaphore::new(1));
-    let permit = slots.clone().acquire_owned().await.unwrap();
+async fn unpolled_downstream_drops_the_upstream_response_at_deadline() {
+    let (guard, dropped) = tokio::sync::oneshot::channel::<()>();
+    // 这个发送端跟随模拟上游响应。只有响应被释放，接收端才会收到关闭通知。
+    let upstream = async_stream::stream! {
+        let _guard = guard;
+        yield Ok::<_, std::io::Error>(Bytes::from_static(b"buffered"));
+    };
     let response = delivery::bounded(
-        Response::new(Body::from("buffered")),
-        permit,
+        Response::new(Body::from_stream(upstream)),
         Instant::now() + Duration::from_millis(30),
     );
-    assert!(slots.clone().try_acquire_owned().is_err());
-    let _permit = timeout(Duration::from_secs(1), slots.acquire())
+    timeout(Duration::from_secs(1), dropped)
         .await
-        .unwrap()
-        .unwrap();
+        .expect("下游没有读取正文时，超时也应释放上游响应")
+        .expect_err("上游响应只在析构时关闭通知通道");
     assert!(to_bytes(response.into_body(), 1024).await.is_err());
 }
