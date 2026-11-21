@@ -9,7 +9,7 @@
 ```sh
 sh deploy/compose/init-env.sh
 docker compose config --quiet
-docker compose up -d --build
+docker compose up -d --build --wait relay
 docker compose ps
 curl -fsS http://127.0.0.1:8000/healthz
 ```
@@ -36,21 +36,30 @@ curl -fsSN http://127.0.0.1:8000/v1/chat/completions \
 | `relay_stage` | `stage` 标识聊天、模型列表或通用 HTTP 转发。`event=attempt` 表示准备转发，`response` 表示收到响应，`failed` 或 `stream_failed` 配合 `reason` 定位失败原因。有上游响应时可查看 `upstream_status`。 |
 | `relay_history` | `outcome=hit` 表示找到可回放的回答，`miss` 表示这次未返回历史。`reason` 可以区分精确命中、向量命中、缓存不可用等情况。 |
 
-## 用现有模型卷启用原生向量
+## 启用向量回放
 
-将以下配置放入原先使用的环境文件。保留上一版的模型标签、阈值、策略版本、Redis 前缀，以及 MySQL 配置。Python 版和 Rust 版的向量检索都将记录限制在同一请求范围内。
+在项目的 `.env` 中设置以下两项。Compose 会把同一套配置传给模型初始化服务和 Relay。默认 `HISTORY_EMBEDDING_MODE=off`，普通转发和精确回放都可以直接使用。
 
 ```dotenv
 HISTORY_NEAR_MODE=replay
 HISTORY_EMBEDDING_MODE=replay
-HISTORY_EMBEDDING_MODEL=embeddinggemma:300m-qat-q8_0
 ```
 
-Compose 会将原有 `ollama-data` 卷只读挂到 Relay 容器的 `/var/lib/recall-model-store`。Rust 根据标签对应的固定 SHA-256，从 `models/blobs/sha256-<摘要>` 读取 GGUF，并校验整份文件。模型目录和文件需允许容器的 UID 10001 遍历、读取。新项目复用已有模型时，在 `.env` 填入 Docker 的实际卷名 `MODEL_VOLUME_NAME` 并设置 `MODEL_VOLUME_EXTERNAL=true`。Compose 将检查该卷已存在，移除项目时会保留它。Redis 和 MySQL 默认使用新项目各自的数据卷。
+两项均为 `shadow` 或 `replay` 时，一次性服务 `model-init` 会检查模型卷。默认权重是约 338 MB 的 `embeddinggemma:300m-qat-q8_0`。旧卷中的文件通过 SHA-256 校验即可离线复用。文件缺少或校验失败时，`model-init` 从 Ollama 官方仓库下载到同卷临时文件，校验通过后再移到正式路径。任一模式为 `off` 时跳过模型检查和下载。[官方模型页](https://ollama.com/library/embeddinggemma:300m-qat-q8_0)
 
-直接提供 GGUF 时，可将权重只读挂载为 `/weights/embeddinggemma.gguf`，设置 `HISTORY_EMBEDDING_MODEL_PATH` 指向该路径。文件仍须匹配 [model_file.rs](../../src/model_file.rs) 中为该标签固定的 SHA-256。
+首次启动、拉取更新或改动模式后，都在项目目录用同一条命令启动 Relay。
 
-新安装可以先用默认的 `HISTORY_EMBEDDING_MODE=off`。需要向量时，先准备匹配该标签的模型权重，再切换成 `shadow` 观测或 `replay` 回放。Rust 镜像从源码编译推理库，不随镜像打包权重。Relay 内存上限由 `RELAY_MEMORY_LIMIT` 配置，默认 2 GiB，包含模型映射、推理缓冲区和 HTTP 请求。兼容现有 EmbeddingGemma GGUF 时，Relay 会在可写的 /tmp 创建约 338 MB 的临时副本。Compose 为 /tmp 提供 768 MiB 的 tmpfs，其实际占用计入容器内存；模型卷始终只读。
+```sh
+docker compose up -d --build --wait relay
+```
+
+这条命令会等待 `model-init` 成功退出再启动 Relay。`--no-deps` 会跳过这一步。下载失败时可用 `docker compose logs model-init` 查看原因，网络恢复后重新执行启动命令。
+
+Relay 将 `ollama-data` 卷只读挂载到 `/var/lib/recall-model-store`。默认文件路径为卷内的 `models/blobs/sha256-<摘要>`。从旧项目迁移时，在 `.env` 将 `MODEL_VOLUME_NAME` 设为已有 Docker 卷的实际名称，并设 `MODEL_VOLUME_EXTERNAL=true`。复用旧历史时也要沿用原先的模型标签、阈值、策略版本、Redis 前缀和 MySQL 配置。
+
+自备卷外 GGUF 时，可将文件只读挂载为 `/weights/embeddinggemma.gguf`，再设置 `HISTORY_EMBEDDING_MODEL_PATH=/weights/embeddinggemma.gguf`。也可挂载自备的模型目录并指定 `HISTORY_EMBEDDING_MODEL_DIR`。卷外权重由部署者提供，Relay 以 UID 10001 读取并校验。文件须匹配该标签固定的 SHA-256。[权重校验实现](../../src/model_file.rs)
+
+Relay 在进程内加载模型并预热。为兼容原有 GGUF，它在容器的 `/tmp` 中创建约 338 MB 的临时副本。Compose 为 `/tmp` 配置了 768 MiB 的 tmpfs，实际占用计入 Relay 的内存上限（`RELAY_MEMORY_LIMIT`，默认 2 GiB）。
 
 ### 切换到新部署
 

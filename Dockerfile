@@ -16,6 +16,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     && rm -rf /var/lib/apt/lists/*
 USER 10001:10001
 
+FROM runtime AS model-init
+COPY deploy/compose/prepare-model.sh /usr/local/bin/prepare-model.sh
+COPY src/embeddinggemma.sha256 /usr/local/share/recall-relay/embeddinggemma.sha256
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/prepare-model.sh"]
+
 FROM runtime AS mock-upstream
 COPY --from=build /app/target/release/examples/mock_upstream /usr/local/bin/mock-upstream
 ENV MOCK_BIND=0.0.0.0:8091

@@ -117,7 +117,7 @@ curl -si http://127.0.0.1:8000/v1/chat/completions \
 | `TOTAL_TIMEOUT_SECONDS`、`STREAM_TIMEOUT_SECONDS` | 默认请求总预算 60 秒。启用历史后，已经提交的聊天流有独立预算，默认 600 秒。非流式、SSE 启动和 Sulphur 的细分预算见 [src/config.rs](src/config.rs)。 |
 | `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` | 配置长期存储。Redis 热缓存默认保留 24 小时、最多 1024 条。MySQL 命中后会回填 Redis。 |
 | `HISTORY_NEAR_MODE`、`HISTORY_EMBEDDING_MODE` | 可选 `off`、`shadow` 或 `replay`。`shadow` 只观察近似命中。默认启用规则匹配，关闭嵌入。 |
-| `HISTORY_EMBEDDING_MODEL_PATH` | Rust 在进程内读取原有 `embeddinggemma:300m-qat-q8_0` 权重，可指定原始 GGUF 文件或挂载既有模型卷。启用向量时，服务启动前会校验权重并预热。 |
+| `HISTORY_EMBEDDING_MODEL_PATH` | 留空使用模型目录内的默认权重。Compose 启用向量时会复用卷内通过校验的模型，缺少或损坏则自动下载。也可指定自备 GGUF 文件在容器内的路径。 |
 | `RELAY_LOG_CONTENT` | 默认 `true`，在容器标准输出预览实际请求和响应。正文内的业务数据也会出现在预览中。 |
 | `RUST_LOG` | 例如 `recall_relay=debug` 可以查看降级阶段及命中计数。 |
 

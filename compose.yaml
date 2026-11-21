@@ -1,3 +1,11 @@
+# 初始化服务与 Relay 使用相同的模式和路径，避免下载到另一处目录。
+x-vector-environment: &vector-environment
+  HISTORY_NEAR_MODE: ${HISTORY_NEAR_MODE:-replay}
+  HISTORY_EMBEDDING_MODE: ${HISTORY_EMBEDDING_MODE:-off}
+  HISTORY_EMBEDDING_MODEL: ${HISTORY_EMBEDDING_MODEL:-embeddinggemma:300m-qat-q8_0}
+  HISTORY_EMBEDDING_MODEL_DIR: ${HISTORY_EMBEDDING_MODEL_DIR:-/var/lib/recall-model-store/models}
+  HISTORY_EMBEDDING_MODEL_PATH: "${HISTORY_EMBEDDING_MODEL_PATH:-}"
+
 services:
   relay:
     build: .
@@ -8,11 +16,14 @@ services:
         host_ip: "${RELAY_BIND_HOST:-127.0.0.1}"
         protocol: tcp
     depends_on:
+      model-init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
       mysql:
         condition: service_healthy
     environment:
+      <<: *vector-environment
       RELAY_BIND: "0.0.0.0:8000"
       RELAY_LOG_CONTENT: "${RELAY_LOG_CONTENT:-true}"
       INGRESS_ORIGIN: http://127.0.0.1:8000
@@ -25,11 +36,6 @@ services:
       MYSQL_USER: ${MYSQL_USER:-recall_relay}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in the Compose env file}
       MYSQL_HISTORY_READ_TIMEOUT_SECONDS: ${MYSQL_HISTORY_READ_TIMEOUT_SECONDS:-0.25}
-      HISTORY_NEAR_MODE: ${HISTORY_NEAR_MODE:-replay}
-      HISTORY_EMBEDDING_MODE: ${HISTORY_EMBEDDING_MODE:-off}
-      HISTORY_EMBEDDING_MODEL: ${HISTORY_EMBEDDING_MODEL:-embeddinggemma:300m-qat-q8_0}
-      HISTORY_EMBEDDING_MODEL_DIR: ${HISTORY_EMBEDDING_MODEL_DIR:-/var/lib/recall-model-store/models}
-      HISTORY_EMBEDDING_MODEL_PATH: "${HISTORY_EMBEDDING_MODEL_PATH:-}"
       HISTORY_EMBEDDING_THRESHOLD: ${HISTORY_EMBEDDING_THRESHOLD:-0.90}
       HISTORY_EMBEDDING_LAST_RESORT_THRESHOLD: "${HISTORY_EMBEDDING_LAST_RESORT_THRESHOLD:-}"
       HISTORY_EMBEDDING_TIMEOUT_SECONDS: ${HISTORY_EMBEDDING_TIMEOUT_SECONDS:-0.65}
@@ -46,10 +52,9 @@ services:
       MAX_BODY_BYTES: ${MAX_BODY_BYTES:-10485760}
     volumes:
       # ollama-data 是保存模型的 Docker 卷。:ro 表示只读，Rust 直接加载卷里的权重。
-      # 默认 HISTORY_EMBEDDING_MODE=off 可跳过下载。启用 shadow 或 replay 前，先准备好模型。
-      # 旧卷已有 embeddinggemma:300m-qat-q8_0 时可直接复用。新卷请从下面的 Ollama 官方链接下载 GGUF（约 338 MB）。
+      # 默认关闭向量时跳过下载。开启后 model-init 会复用校验通过的权重，缺失或损坏则从官方仓库下载约 338 MB。
       # https://registry.ollama.ai/v2/library/embeddinggemma/blobs/sha256:ed705a9a986a4c6c26bb9cdd92e232ec1ca1525ae952e41c8600793d6e28ebb3
-      # 下载后按下面的路径和文件名保存到卷内，Rust 会按文件名中的 SHA-256 校验权重。
+      # 默认保存在以下卷内路径，Rust 启动时会校验权重并预热模型。
       # models/blobs/sha256-ed705a9a986a4c6c26bb9cdd92e232ec1ca1525ae952e41c8600793d6e28ebb3
       - ollama-data:/var/lib/recall-model-store:ro
     # 原生加载时要创建临时 GGUF 兼容副本，原始权重卷始终只读。
@@ -65,6 +70,21 @@ services:
     security_opt: [no-new-privileges:true]
     mem_limit: ${RELAY_MEMORY_LIMIT:-2g}
     stop_grace_period: 75s
+
+  model-init:
+    build:
+      context: .
+      target: model-init
+    environment: *vector-environment
+    # 初始化进程负责给新卷建目录；它结束后，Relay 用 UID 10001 只读加载权重。
+    user: "0:0"
+    read_only: true
+    cap_drop: [ALL]
+    # 旧卷的目录可能属于原 Ollama 容器的用户。允许初始化进程在其中补齐权重。
+    cap_add: [DAC_OVERRIDE]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - ollama-data:/var/lib/recall-model-store
 
   redis:
     image: redis:7.4.12-alpine

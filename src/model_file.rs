@@ -12,7 +12,8 @@ use std::{
 use tempfile::NamedTempFile;
 
 const TAG: &str = "embeddinggemma:300m-qat-q8_0";
-const SHA256: &str = "ed705a9a986a4c6c26bb9cdd92e232ec1ca1525ae952e41c8600793d6e28ebb3";
+// Compose 下载器和 Rust 加载器共用同一份摘要，旧卷中的文件名也由它决定。
+const SHA256: &str = include_str!("embeddinggemma.sha256").trim_ascii_end();
 const HEADER_SHA256: &str = "36645126bd3388921fba778c4dca2a3979aa7f43c0e15607256afd41f67a4492";
 // 此版本文件中第一个张量的数据起点，已经按 GGUF 要求对齐到了 32 字节。
 const DATA_START: usize = 6_530_176;

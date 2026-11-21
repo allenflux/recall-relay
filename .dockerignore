@@ -6,3 +6,6 @@
 !src/**
 !examples/
 !examples/**
+!deploy/
+!deploy/compose/
+!deploy/compose/prepare-model.sh
