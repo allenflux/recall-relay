@@ -44,8 +44,13 @@ services:
       SULPHUR_NONSTREAM_UPSTREAM_TIMEOUT_SECONDS: "${SULPHUR_NONSTREAM_UPSTREAM_TIMEOUT_SECONDS:-}"
       REJECT_EMPTY_JSON_COMPLETIONS: "${REJECT_EMPTY_JSON_COMPLETIONS:-false}"
       MAX_BODY_BYTES: ${MAX_BODY_BYTES:-10485760}
-    # 沿用旧项目的卷名。原有部署对 ollama-data 的 external 映射会同时用于这里。
     volumes:
+      # ollama-data 是保存模型的 Docker 卷。:ro 表示只读，Rust 直接加载卷里的权重。
+      # 默认 HISTORY_EMBEDDING_MODE=off 可跳过下载。启用 shadow 或 replay 前，先准备好模型。
+      # 旧卷已有 embeddinggemma:300m-qat-q8_0 时可直接复用。新卷请从下面的 Ollama 官方链接下载 GGUF（约 338 MB）。
+      # https://registry.ollama.ai/v2/library/embeddinggemma/blobs/sha256:ed705a9a986a4c6c26bb9cdd92e232ec1ca1525ae952e41c8600793d6e28ebb3
+      # 下载后按下面的路径和文件名保存到卷内，Rust 会按文件名中的 SHA-256 校验权重。
+      # models/blobs/sha256-ed705a9a986a4c6c26bb9cdd92e232ec1ca1525ae952e41c8600793d6e28ebb3
       - ollama-data:/var/lib/recall-model-store:ro
     # 原生加载时要创建临时 GGUF 兼容副本，原始权重卷始终只读。
     tmpfs:
