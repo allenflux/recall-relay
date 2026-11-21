@@ -45,7 +45,7 @@ async fn native_matches_python_ollama_vectors() -> Result<()> {
         let label = case["label"].as_str().unwrap();
         let reference = legacy_vector(case)?;
         let output = embedder
-            .embed(text, BUDGET)
+            .embed(text, BUDGET, true)
             .await
             .with_context(|| format!("原生引擎计算 {label} 失败"))?;
         let score = cosine(&reference, &output)?;

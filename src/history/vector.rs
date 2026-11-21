@@ -269,7 +269,7 @@ impl Vectors {
         let (Some(prompt), Some(scope)) = (id.prompt, id.scope) else {
             return Ok(());
         };
-        let Some(vector) = self.embedder.embed(&prompt, WRITE_TIMEOUT).await else {
+        let Some(vector) = self.embedder.embed(&prompt, WRITE_TIMEOUT, false).await else {
             return Ok(());
         };
         let marker = self.marker(&job.group);
@@ -304,6 +304,7 @@ impl Vectors {
         hot: &Hot,
         archive: Option<&Archive>,
         id: &Identity,
+        wait_for_cpu: bool,
     ) -> Option<Match> {
         let prompt = id.prompt.as_deref()?;
         if !id.intent_eligible {
@@ -322,7 +323,11 @@ impl Vectors {
                 continue;
             }
             if query.is_none() {
-                query = Some(self.embedder.embed(prompt, self.timeout).await?);
+                query = Some(
+                    self.embedder
+                        .embed(prompt, self.timeout, wait_for_cpu)
+                        .await?,
+                );
             }
             let scores = rank(query.as_deref()?, candidates);
             let Some(best) = scores.first() else { continue };

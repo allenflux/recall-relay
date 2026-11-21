@@ -95,6 +95,8 @@ curl -si http://127.0.0.1:8000/v1/chat/completions \
 
 后台按入队顺序写入回答，MySQL 会把已排队的多条回答合并提交。可选的向量索引在另一条队列上生成。向量计算繁忙时可能跳过索引，已经保存的完整回答仍可精确回放。
 
+上游失败、精确缓存未命中且找到向量候选时，开启 `replay` 的请求会按到达推理槽的顺序排队。轮到该请求后才开始计算单次推理的超时。排队和推理共用本次请求剩余的总时间，SSE 使用启动阶段的剩余时间。普通请求仍直接并发转发上游，精确缓存命中也能立即返回。
+
 上游超时、限流、服务故障或返回原因未知的错误（包括 HTTP 400、422）时，Relay 在向客户端发送回答前查询缓存。即使 HTTP 状态是 200，JSON 正文或 SSE 首个事件中出现的上游错误也按相同规则处理。遇到明确的鉴权失败、权限不足、内容政策拒绝或模型不存在时，Relay 直接转发上游响应。
 
 | 来源 | 条件与行为 |
@@ -117,6 +119,7 @@ curl -si http://127.0.0.1:8000/v1/chat/completions \
 | `TOTAL_TIMEOUT_SECONDS`、`STREAM_TIMEOUT_SECONDS` | 默认请求总预算 60 秒。启用历史后，已经提交的聊天流有独立预算，默认 600 秒。非流式、SSE 启动和 Sulphur 的细分预算见 [src/config.rs](src/config.rs)。 |
 | `MYSQL_HOST`、`MYSQL_PORT`、`MYSQL_USER`、`MYSQL_PASSWORD`、`MYSQL_DATABASE` | 配置长期存储。Redis 热缓存默认保留 24 小时、最多 1024 条。MySQL 命中后会回填 Redis。 |
 | `HISTORY_NEAR_MODE`、`HISTORY_EMBEDDING_MODE` | 可选 `off`、`shadow` 或 `replay`。`shadow` 只观察近似命中。默认启用规则匹配，关闭嵌入。 |
+| `HISTORY_EMBEDDING_TIMEOUT_SECONDS` | 单条在线向量推理的时限，默认 0.65 秒，从取得推理槽开始计时。 |
 | `HISTORY_EMBEDDING_MODEL_PATH` | 留空使用模型目录内的默认权重。Compose 启用向量时会复用卷内通过校验的模型，缺少或损坏则自动下载。也可指定自备 GGUF 文件在容器内的路径。 |
 | `RELAY_LOG_CONTENT` | 默认 `true`，在容器标准输出预览实际请求和响应。正文内的业务数据也会出现在预览中。 |
 | `RUST_LOG` | 例如 `recall_relay=debug` 可以查看降级阶段及命中计数。 |

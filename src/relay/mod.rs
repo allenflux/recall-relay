@@ -400,12 +400,8 @@ impl Relay {
             if !remaining.is_zero() {
                 let validate =
                     |body: &[u8]| protocol::prepare_history(body, &turn.request, streaming, reject);
-                match timeout(
-                    c.fallback_budget.min(remaining),
-                    self.history.lookup(Some(id), validate),
-                )
-                .await
-                {
+                // 上游已结束，剩余时间可以用来排队等向量回放。仍给发送响应留出余量。
+                match timeout(remaining, self.history.lookup(Some(id), validate)).await {
                     Ok((Some(body), reason)) => {
                         self.count(&format!("fallback_{reason}"));
                         tracing::info!(outcome = "hit", reason, "relay_history");

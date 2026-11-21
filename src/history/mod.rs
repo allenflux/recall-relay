@@ -257,6 +257,7 @@ impl History {
         }
     }
 
+    /// 为上游失败后的历史读取和一次推理预留时间。排队可以利用上游提前结束后剩下的时间。
     pub fn fallback_budget(&self) -> Duration {
         let archive_budget = self.storage.archive.as_ref().map(Archive::read_timeout);
         let Some(vectors) = &self.storage.vectors else {
@@ -358,6 +359,7 @@ impl History {
     }
 
     /// validate 由 HTTP 层提供。即使键命中，也要核实记录是一条可安全回放的完整回答。
+    /// 向量回放可能等待空闲的推理槽。调用方可用自己的请求期限取消这次查找。
     pub async fn lookup(
         &self,
         id: Option<&Identity>,
@@ -377,16 +379,12 @@ impl History {
         let Some(vectors) = &self.storage.vectors else {
             return (None, outcome);
         };
-        let mut budget = vectors.timeout + IO + archive_time * 2;
-        if vectors.last_resort.is_some() {
-            budget += (IO / 2).max(archive_time);
-        }
-        let Ok(Some(answer)) =
-            timeout(budget, vectors.lookup(&self.storage.hot, archive, id)).await
-        else {
+        // 各次存储读取和实际推理都有独立超时。只有能把向量结果发给客户端时才排队。
+        let replay = self.storage.near_mode == Mode::Replay && vectors.mode == Mode::Replay;
+        let Some(answer) = vectors.lookup(&self.storage.hot, archive, id, replay).await else {
             return (None, outcome);
         };
-        if self.storage.near_mode == Mode::Shadow || vectors.mode == Mode::Shadow {
+        if !replay {
             return (None, answer.shadow_outcome);
         }
         let Some(body) = validate(&answer.body) else {

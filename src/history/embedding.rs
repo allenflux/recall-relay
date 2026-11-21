@@ -108,12 +108,31 @@ impl Embedder {
         }
     }
 
-    pub(super) async fn embed(&self, prompt: &str, budget: Duration) -> Option<Vec<f64>> {
+    pub(super) async fn embed(
+        &self,
+        prompt: &str,
+        budget: Duration,
+        wait_for_cpu: bool,
+    ) -> Option<Vec<f64>> {
         if prompt.trim().is_empty() || prompt.chars().count() > 512 {
             return None;
         }
+        // 在线回放按到达推理槽的顺序等待。取消等待会自动退出队列，不会留下待算的任务。
+        // 后台建索引和 shadow 只尝试拿空闲的槽，不与等待回放的请求争抢。
+        let slot = self.slot.clone();
+        let permit = if wait_for_cpu {
+            let queued_at = Instant::now();
+            let permit = slot.acquire_owned().await.ok()?;
+            tracing::debug!(
+                wait_ms = queued_at.elapsed().as_millis(),
+                "向量回放取得推理槽"
+            );
+            permit
+        } else {
+            slot.try_acquire_owned().ok()?
+        };
+        // 拿到槽才开始计算本次推理的超时。HTTP 请求的总期限同时覆盖排队和计算。
         let until = Instant::now().checked_add(budget)?;
-        let permit = self.slot.clone().try_acquire_owned().ok()?;
         let (answer, reply) = oneshot::channel();
         let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
         let job = Job {
@@ -138,6 +157,7 @@ impl Embedder {
 
     fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
+        self.slot.close();
         self.sender.lock().expect("向量发送端锁未损坏").take();
     }
 
@@ -178,6 +198,73 @@ mod compatibility;
 mod tests {
     use super::*;
 
+    // 用测试端接收任务，手动决定何时归还 CPU，排队顺序就不依赖模型速度。
+    fn manual_worker() -> (Embedder, mpsc::Receiver<Job>) {
+        let (sender, receiver) = mpsc::channel(1);
+        let (_, ready) = watch::channel(Some(Ok(())));
+        let native = Embedder {
+            model: String::new(),
+            sender: Mutex::new(Some(sender)),
+            slot: Arc::new(Semaphore::new(1)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            ready,
+            thread: Mutex::new(None),
+        };
+        (native, receiver)
+    }
+
+    #[tokio::test]
+    async fn replay_waits_in_order_and_keeps_its_inference_budget() {
+        let (native, mut jobs) = manual_worker();
+        let occupied = native.slot.clone().try_acquire_owned().unwrap();
+        let budget = Duration::from_millis(20);
+        let mut first = Box::pin(native.embed("第一条", budget, true));
+        let mut cancelled = Box::pin(native.embed("将取消", budget, true));
+        let mut last = Box::pin(native.embed("最后一条", budget, true));
+        assert!(futures_util::poll!(&mut first).is_pending());
+        assert!(futures_util::poll!(&mut cancelled).is_pending());
+        assert!(futures_util::poll!(&mut last).is_pending());
+        drop(cancelled);
+
+        // 让等待时间超过单次推理预算。释放许可后，后台写入和后到的回放都不能插队。
+        tokio::time::sleep(budget + Duration::from_millis(5)).await;
+        let released = Instant::now();
+        drop(occupied);
+        let mut background = Box::pin(native.embed("后台索引", budget, false));
+        assert_eq!(
+            futures_util::poll!(&mut background),
+            std::task::Poll::Ready(None)
+        );
+        assert!(futures_util::poll!(&mut last).is_pending());
+        assert!(futures_util::poll!(&mut first).is_pending());
+        let job = jobs.try_recv().unwrap();
+        assert_eq!(job.input, format!("{PREFIX}第一条"));
+        assert!(job.until >= released + budget);
+        drop(job.slot);
+        job.answer.send(Some(vec![1.0])).unwrap();
+        assert_eq!(first.await, Some(vec![1.0]));
+
+        assert!(futures_util::poll!(&mut last).is_pending());
+        let job = jobs.try_recv().unwrap();
+        assert_eq!(job.input, format!("{PREFIX}最后一条"));
+        drop(job.slot);
+        job.answer.send(Some(vec![2.0])).unwrap();
+        assert_eq!(last.await, Some(vec![2.0]));
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_replay_waiting_for_a_busy_cpu() {
+        let (native, _jobs) = manual_worker();
+        let _occupied = native.slot.clone().try_acquire_owned().unwrap();
+        let mut waiting = Box::pin(native.embed("等待停机", Duration::from_secs(1), true));
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        native.stop();
+        assert_eq!(
+            futures_util::poll!(&mut waiting),
+            std::task::Poll::Ready(None)
+        );
+    }
+
     #[tokio::test]
     #[ignore = "需要本机官方 EmbeddingGemma GGUF"]
     async fn cancelled_inference_releases_the_cpu_and_shutdown_joins_the_worker() -> Result<()> {
@@ -185,25 +272,18 @@ mod tests {
         native.ready().await?;
         let budget = Duration::from_secs(5);
 
-        // 手动 poll 第一个 future，确保它先拿到许可。第二个请求此时应立刻跳过计算。
+        // 手动 poll 回放请求，确保它先拿到许可。后台索引此时应立刻跳过计算。
         let long_prompt = "猫".repeat(512);
-        let mut first = Box::pin(native.embed(&long_prompt, budget));
+        let mut first = Box::pin(native.embed(&long_prompt, budget, true));
         assert!(futures_util::poll!(first.as_mut()).is_pending());
-        assert!(native.embed("second", budget).await.is_none());
+        assert!(native.embed("second", budget, false).await.is_none());
 
-        // 模拟下游断开。等待短任务再次成功，证明中断后仍能复用同一上下文。
+        // 模拟下游断开。下一条回放等线程退出上次推理后，仍能复用同一上下文。
         drop(first);
-        tokio::time::timeout(budget, async {
-            loop {
-                if native.embed("next", budget).await.is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await?;
+        let next = tokio::time::timeout(budget, native.embed("next", budget, true)).await?;
+        assert!(next.is_some());
         native.close().await;
-        assert!(native.embed("closed", budget).await.is_none());
+        assert!(native.embed("closed", budget, true).await.is_none());
         Ok(())
     }
 }
