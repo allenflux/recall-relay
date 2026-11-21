@@ -1,4 +1,4 @@
-//! MySQL 长期历史。在线请求只尝试把成功结果放入队列，后台任务负责落库。
+//! MySQL 长期历史。在线请求将成功回答交给有界队列，后台任务按入队顺序落库。
 //! 故障回放时按键读库，使用独立的短超时，避免数据库拖住当前请求。
 
 use std::{
@@ -17,13 +17,15 @@ use sqlx::{
     mysql::{MySqlConnectOptions, MySqlDatabaseError, MySqlPoolOptions},
 };
 use tokio::{
-    sync::{OnceCell, mpsc},
+    sync::{OnceCell, mpsc, watch},
     task::JoinHandle,
     time::timeout,
 };
 
 const MAX_RESPONSE: usize = 256 * 1024;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+// 只合并队列里已经到达的任务，不等凑满一批。8 个最大回答合计 2 MiB。
+const WRITE_BATCH: usize = 8;
 const INDEX_NAME: &str = "recall_relay_scope_vectors";
 const INDEX_COLUMNS: [&str; 4] = [
     "namespace_hash",
@@ -43,10 +45,6 @@ const CREATE_TABLE: &str = r#"
         PRIMARY KEY (namespace_hash, request_hash),
         KEY recall_relay_scope_vectors (namespace_hash, scope_hash, vector_marker, request_hash)
     ) ENGINE=InnoDB"#;
-const UPSERT: &str = r#"
-    INSERT INTO recall_relay_history (namespace_hash, request_hash, scope_hash, response)
-    VALUES (?, UNHEX(?), UNHEX(?), ?) AS incoming
-    ON DUPLICATE KEY UPDATE scope_hash = incoming.scope_hash, response = incoming.response"#;
 
 enum Write {
     Answer {
@@ -62,6 +60,16 @@ enum Write {
     },
 }
 
+impl Write {
+    fn answer(exact: &str, scope: Option<&str>, body: &[u8]) -> Self {
+        Self::Answer {
+            exact: exact.to_owned(),
+            scope: scope.map(str::to_owned),
+            body: body.to_vec(),
+        }
+    }
+}
+
 struct Database {
     pool: MySqlPool,
     namespace: [u8; 32],
@@ -72,6 +80,7 @@ struct Database {
     vector_schema: OnceCell<()>,
     read_failures: AtomicU64,
     write_failures: AtomicU64,
+    available: watch::Sender<bool>,
 }
 
 struct Writer {
@@ -92,6 +101,10 @@ fn valid_hash(hash: &str) -> bool {
         && hash
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn valid_answer(exact: &str, scope: Option<&str>, body: &[u8]) -> bool {
+    valid_hash(exact) && scope.is_none_or(valid_hash) && (1..=MAX_RESPONSE).contains(&body.len())
 }
 
 fn valid_vector(data: &[u8]) -> bool {
@@ -124,6 +137,15 @@ fn db_errno(error: &sqlx::Error) -> Option<u16> {
             .as_database_error()?
             .try_downcast_ref::<MySqlDatabaseError>()?
             .number(),
+    )
+}
+
+fn row_error(error: &anyhow::Error) -> bool {
+    // 这些错误可能仅与某一行或本批总大小有关。连接失败、权限错误等全库故障
+    // 即使拆成单条也无法修复，勿在队列里为每条重复耗尽写入超时。
+    matches!(
+        error.downcast_ref::<sqlx::Error>().and_then(db_errno),
+        Some(1048 | 1062 | 1118 | 1153 | 1264 | 1292 | 1366 | 1406 | 3819)
     )
 }
 
@@ -181,6 +203,7 @@ impl Archive {
             vector_schema: OnceCell::new(),
             read_failures: AtomicU64::new(0),
             write_failures: AtomicU64::new(0),
+            available: watch::Sender::new(true),
         });
         let (sender, receiver) = mpsc::channel(64);
         let task = tokio::spawn(Arc::clone(&db).run_writer(receiver));
@@ -198,6 +221,10 @@ impl Archive {
         self.db.read_timeout
     }
 
+    pub(crate) fn writes_available(&self) -> bool {
+        self.db.table.initialized() && *self.db.available.borrow()
+    }
+
     fn offer(&self, item: Option<Write>) -> bool {
         let sender = self.writer.sender.lock().expect("队列锁未被破坏");
         if let (Some(item), Some(sender)) = (item, sender.as_ref())
@@ -210,15 +237,31 @@ impl Archive {
     }
 
     pub fn enqueue(&self, exact: &str, scope: Option<&str>, body: &[u8]) -> bool {
-        let valid = valid_hash(exact)
-            && scope.is_none_or(valid_hash)
-            && (1..=MAX_RESPONSE).contains(&body.len());
-        // &str、&[u8] 是临时借用。请求结束后后台任务仍要写入，所以在入队时复制并移交所有权。
-        self.offer(valid.then(|| Write::Answer {
-            exact: exact.to_owned(),
-            scope: scope.map(str::to_owned),
-            body: body.to_vec(),
-        }))
+        self.offer(valid_answer(exact, scope, body).then(|| Write::answer(exact, scope, body)))
+    }
+
+    /// HTTP 路径使用此方法。当数据库健康但写入跟不上时，异步等待队列腾出位置。
+    /// 先取得许可再复制正文。等待者只借用原回答，也不会占有队列的互斥锁。
+    pub async fn enqueue_wait(&self, exact: &str, scope: Option<&str>, body: &[u8]) -> bool {
+        if !valid_answer(exact, scope, body) {
+            return false;
+        }
+        let sender = self.writer.sender.lock().expect("队列锁未被破坏").clone();
+        let Some(sender) = sender else { return false };
+        let mut available = self.db.available.subscribe();
+        let permit = tokio::select! {
+            // 有空位时始终让后台尝试写库，使暂时断开的 MySQL 有机会恢复。
+            biased;
+            slot = sender.reserve() => slot.ok(),
+            // 若队列已满且后台确认数据库不可用，唤醒等待者，交给独立的 Redis 路径。
+            _ = available.wait_for(|online| !online) => None,
+        };
+        if let Some(permit) = permit {
+            permit.send(Write::answer(exact, scope, body));
+            return true;
+        }
+        note(&self.writer.dropped, "mysql_history_drop");
+        false
     }
 
     pub fn enqueue_vector(&self, exact: &str, scope: &str, marker: &[u8], data: &[u8]) -> bool {
@@ -330,14 +373,11 @@ impl Archive {
         outcome
     }
 
-    /// 先关闭发送端，后台任务会依序处理已有记录。超过一次写超时后终止剩余工作。
+    /// 关闭入口后，等待后台处理完已接收的写入。每次 SQL 仍受独立的超时约束。
     pub async fn close(&self) {
         self.writer.sender.lock().expect("队列锁未被破坏").take();
         let mut task_guard = self.writer.task.lock().await;
-        if let Some(mut task) = task_guard.take()
-            && timeout(WRITE_TIMEOUT, &mut task).await.is_err()
-        {
-            task.abort();
+        if let Some(task) = task_guard.take() {
             let _ = task.await;
         }
         self.db.pool.close().await;
@@ -422,25 +462,20 @@ impl Database {
         Ok(())
     }
 
-    async fn store(&self, item: Write) -> Result<()> {
+    // 调用者只传连续的回答，或一条向量更新。即使同一键在一批中多次出现，
+    // MySQL 也会按 VALUES 中的先后顺序处理，最后一次回答覆盖之前的回答。
+    async fn store(&self, items: &[Write]) -> Result<()> {
         self.ready().await?;
-        match item {
-            Write::Answer { exact, scope, body } => {
-                sqlx::query(UPSERT)
-                    .bind(self.namespace.as_slice())
-                    .bind(exact)
-                    .bind(scope)
-                    .bind(body)
-                    .execute(&self.pool)
-                    .await?;
-            }
-            Write::Vector {
-                exact,
-                scope,
-                marker,
-                data,
-            } => {
-                let marker = scoped_marker(&scope, &marker).context("向量作用域无效")?;
+        match items {
+            [
+                Write::Vector {
+                    exact,
+                    scope,
+                    marker,
+                    data,
+                },
+            ] => {
+                let marker = scoped_marker(scope, marker).context("向量作用域无效")?;
                 self.ensure_vector_schema().await?;
                 // UPDATE 只给已有的成功记录补向量，防止创建没有回答的索引条目。
                 sqlx::query(
@@ -455,18 +490,88 @@ impl Database {
                 .execute(&self.pool)
                 .await?;
             }
+            answers => {
+                let mut sql = sqlx::QueryBuilder::new(
+                    "INSERT INTO recall_relay_history (namespace_hash, request_hash, scope_hash, response) ",
+                );
+                sql.push_values(answers, |mut row, item| {
+                    let Write::Answer { exact, scope, body } = item else {
+                        unreachable!("向量更新须独立执行")
+                    };
+                    row.push_bind(self.namespace.as_slice());
+                    row.push("UNHEX(")
+                        .push_bind_unseparated(exact)
+                        .push_unseparated(")");
+                    row.push("UNHEX(")
+                        .push_bind_unseparated(scope.as_deref())
+                        .push_unseparated(")");
+                    row.push_bind(body);
+                });
+                sql.push(" AS incoming ON DUPLICATE KEY UPDATE scope_hash = incoming.scope_hash, response = incoming.response");
+                sql.build().execute(&self.pool).await?;
+            }
         }
         Ok(())
     }
 
+    async fn store_with_timeout(&self, items: &[Write]) -> Result<()> {
+        timeout(WRITE_TIMEOUT, self.store(items)).await?
+    }
+
+    fn set_available(&self, available: bool) {
+        if *self.available.borrow() != available {
+            self.available.send_replace(available);
+        }
+    }
+
     async fn run_writer(self: Arc<Self>, mut receiver: mpsc::Receiver<Write>) {
         if !matches!(timeout(WRITE_TIMEOUT, self.ready()).await, Ok(Ok(()))) {
+            self.set_available(false);
             eprintln!("mysql_history_initialize_failed");
         }
-        while let Some(item) = receiver.recv().await {
-            if !matches!(timeout(WRITE_TIMEOUT, self.store(item)).await, Ok(Ok(()))) {
-                note(&self.write_failures, "mysql_history_write_failed");
+        let mut batch = Vec::with_capacity(WRITE_BATCH);
+        while receiver.recv_many(&mut batch, WRITE_BATCH).await > 0 {
+            // 遇到向量时先提交前面的回答，保证 UPDATE 总能跟随对应的 INSERT。
+            for group in batch
+                .chunk_by(|a, b| matches!((a, b), (Write::Answer { .. }, Write::Answer { .. })))
+            {
+                // 旧表的向量列或迁移权限可能单独出错，不影响普通回答的写入。
+                if matches!(group, [Write::Vector { .. }]) {
+                    if self.store_with_timeout(group).await.is_err() {
+                        note(&self.write_failures, "mysql_vector_write_failed");
+                    }
+                    continue;
+                }
+                match self.store_with_timeout(group).await {
+                    Ok(()) => self.set_available(true),
+                    Err(error) if group.len() > 1 && row_error(&error) => {
+                        // 一行被约束拒绝或批次超出包大小时，其他合法回答仍可分别写入。
+                        for item in group {
+                            if self
+                                .store_with_timeout(std::slice::from_ref(item))
+                                .await
+                                .is_err()
+                            {
+                                note(&self.write_failures, "mysql_history_write_failed");
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        for _ in group {
+                            note(&self.write_failures, "mysql_history_write_failed");
+                        }
+                        if !row_error(&error) {
+                            self.set_available(false);
+                            if receiver.is_closed() {
+                                // 已停机且数据库不可用，不把剩余队列逐条等到超时。
+                                eprintln!("mysql_history_shutdown_unavailable");
+                                return;
+                            }
+                        }
+                    }
+                }
             }
+            batch.clear();
         }
     }
 }
@@ -513,6 +618,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn healthy_http_writer_waits_for_space_and_wakes_on_outage() {
+        let archive = Archive::start(
+            MySqlConnectOptions::new().host("127.0.0.1").port(0),
+            "wait-test",
+            Duration::from_millis(75),
+        );
+        // 用测试接收端手动释放一个槽，能确定触发满队列，无需假设数据库写入速度。
+        archive.writer.task.lock().await.take().unwrap().abort();
+        let (sender, mut receiver) = mpsc::channel(1);
+        archive.writer.sender.lock().unwrap().replace(sender);
+        let key = "b".repeat(64);
+        assert!(archive.enqueue_wait(&key, None, b"first").await);
+        let next = archive.enqueue_wait(&key, None, b"second");
+        tokio::pin!(next);
+        assert!(futures_util::poll!(&mut next).is_pending());
+        assert!(
+            matches!(receiver.recv().await, Some(Write::Answer {body, ..}) if body == b"first")
+        );
+        assert!(next.await);
+        let blocked = archive.enqueue_wait(&key, None, b"third");
+        tokio::pin!(blocked);
+        assert!(futures_util::poll!(&mut blocked).is_pending());
+        archive.db.set_available(false);
+        assert!(!blocked.await);
+        assert!(
+            matches!(receiver.recv().await, Some(Write::Answer {body, ..}) if body == b"second")
+        );
+        assert!(archive.enqueue_wait(&key, None, b"recovery probe").await);
+        archive.close().await;
+        assert!(!archive.enqueue_wait(&key, None, b"after close").await);
+    }
+
+    #[tokio::test]
     #[ignore = "需要隔离的 MySQL 8.4 测试库，参数使用 TEST_MYSQL_* 环境变量"]
     async fn mysql_shares_responses_and_scans_vectors_across_pools() -> Result<()> {
         let options = MySqlConnectOptions::new()
@@ -533,10 +671,33 @@ mod tests {
         let marker = [1; 32];
         let vector = [0x3f, 0x80, 0, 0]; // 网络字节序的 1.0f32。
         for exact in [&first, &second] {
-            assert!(writer.enqueue(exact, Some(&scope), &[0, 255]));
+            assert!(writer.enqueue_wait(exact, Some(&scope), &[0, 255]).await);
             assert!(writer.enqueue_vector(exact, &scope, &marker, &vector));
         }
+        // 突发覆盖同一键时，跨多个批次也必须按最后一次回答回放。
+        let repeated = "e".repeat(64);
+        for n in 0..128u8 {
+            assert!(writer.enqueue_wait(&repeated, None, &[n]).await);
+        }
+        // 模拟一条损坏的向量，再接一条有效回答。即使随后关闭也应保存最后的回答。
+        let sender = writer.writer.sender.lock().unwrap().clone().unwrap();
+        assert!(
+            sender
+                .send(Write::Vector {
+                    exact: first.clone(),
+                    scope: scope.clone(),
+                    marker: vec![],
+                    data: vector.to_vec(),
+                })
+                .await
+                .is_ok()
+        );
+        drop(sender);
+        let last = "c".repeat(64);
+        assert!(writer.enqueue_wait(&last, None, b"last").await);
         writer.close().await; // 返回时，队列中的模拟数据已经提交给 MySQL。
+        assert_eq!(reader.get(&repeated, None).await?, Some(vec![127]));
+        assert_eq!(reader.get(&last, None).await?, Some(b"last".to_vec()));
         assert_eq!(reader.get(&first, Some(&scope)).await?, Some(vec![0, 255]));
         assert_eq!(reader.get(&first, None).await?, None);
         assert_eq!(other.get(&first, Some(&scope)).await?, None);

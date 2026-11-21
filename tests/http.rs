@@ -517,6 +517,152 @@ async fn sulphur_fallback_requires_plugin_header_and_nonstream_request() {
     assert!(sse.headers().get("x-failover-source").is_none());
 }
 
+#[cfg(unix)]
+async fn isolated_redis(
+    dir: &std::path::Path,
+) -> anyhow::Result<(ChildGuard, String, redis::aio::MultiplexedConnection)> {
+    use anyhow::{Context, ensure};
+
+    let socket = dir.join("redis.sock");
+    let redis_bin = std::env::var("TEST_REDIS_BIN").unwrap_or_else(|_| "redis-server".into());
+    let redis = Command::new(redis_bin)
+        .args(["--port", "0", "--unixsocket"])
+        .arg(&socket)
+        .args(["--save", "", "--appendonly", "no"])
+        .current_dir(dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("无法启动测试 Redis，可设置 TEST_REDIS_BIN")?;
+    let mut redis_process = ChildGuard(redis);
+    let redis_url = format!("redis+unix://{}", socket.display());
+    let database = redis::Client::open(redis_url.as_str())?;
+    let db = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(conn) = database.get_multiplexed_async_connection().await {
+                return anyhow::Ok(conn);
+            }
+            ensure!(redis_process.0.try_wait()?.is_none(), "隔离 Redis 启动失败");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    Ok((redis_process, redis_url, db))
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "需要本机 redis-server"]
+async fn burst_replays_every_completed_json_and_sse_answer() -> anyhow::Result<()> {
+    use futures_util::{StreamExt, stream};
+
+    // 所有请求共用模型和凭据，每个回答都带有对应的问题编号。
+    fn answer(prompt: &str, streaming: bool) -> (&'static str, String) {
+        let text = format!("回答 {prompt}");
+        if streaming {
+            let event = json!({"choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": text},
+                "finish_reason": "stop"
+            }]});
+            (
+                "text/event-stream",
+                format!("data: {event}\n\ndata: [DONE]\n\n"),
+            )
+        } else {
+            let body = json!({"choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop"
+            }]});
+            ("application/json", body.to_string())
+        }
+    }
+
+    let dir = tempfile::tempdir()?;
+    let (_redis, redis_url, mut db) = isolated_redis(dir.path()).await?;
+    let upstream = serve(Router::new().fallback(
+        |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| async move {
+            if headers.get("x-request-id").is_some_and(|v| v == "outage") {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            let (media, raw) = answer(
+                body["messages"][0]["content"].as_str().unwrap(),
+                body["stream"] == true,
+            );
+            ([(header::CONTENT_TYPE, media)], raw).into_response()
+        },
+    ))
+    .await;
+    let (_relay, addr) = start_relay(&[
+        (
+            "UPSTREAM_URL",
+            &format!("http://{upstream}/v1/chat/completions"),
+        ),
+        ("REDIS_URL", &redis_url),
+        ("REDIS_PREFIX", "burst"),
+    ]);
+    let client = client();
+    let url = format!("http://{addr}/v1/chat/completions");
+    const TOTAL: usize = 512;
+    // 让初始一批写操作碰到繁忙的 Redis，比依靠测试机恰好跑得足够快更容易覆盖队列已满的情况。
+    redis::cmd("CLIENT")
+        .arg("PAUSE")
+        .arg(60)
+        .arg("WRITE")
+        .query_async::<()>(&mut db)
+        .await?;
+    for outage in [false, true] {
+        if outage {
+            // 后台写入与 HTTP 传输独立，等到全部精确记录都可读后，再逐条验证回放正文。
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let saved: usize = redis::cmd("ZCARD")
+                        .arg("burst:entries")
+                        .query_async(&mut db)
+                        .await?;
+                    if saved == TOTAL {
+                        return anyhow::Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await??;
+        }
+        stream::iter(0..TOTAL)
+            .for_each_concurrent(16, |index| {
+                let client = &client;
+                let url = &url;
+                async move {
+                    let prompt = format!("问题 {index}");
+                    let streaming = index % 2 == 1;
+                    let body = json!({
+                        "model": "same",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream": streaming
+                    });
+                    let response = client
+                        .post(url)
+                        .bearer_auth("test")
+                        .header("x-request-id", if outage { "outage" } else { "live" })
+                        .json(&body)
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), 200, "{prompt}, outage={outage}");
+                    let source = response
+                        .headers()
+                        .get("x-failover-source")
+                        .map(|v| v.to_str().unwrap());
+                    assert_eq!(source, outage.then_some("history"), "{prompt}");
+                    assert_eq!(response.text().await.unwrap(), answer(&prompt, streaming).1);
+                }
+            })
+            .await;
+    }
+    Ok(())
+}
+
 /// 将原版 Redis 记录装进隔离库，分别模拟可回放错误和必须直接返回的鉴权错误。
 /// 两个问题标点不同，没有新问题的精确记录；只有原生向量命中旧记录才能返回这段回答。
 #[cfg(unix)]
@@ -530,30 +676,7 @@ async fn upstream_errors_use_only_eligible_history() -> anyhow::Result<()> {
     let fixture: Value = serde_json::from_str(include_str!("fixtures/embeddinggemma-ollama.json"))?;
     let legacy = &fixture["legacy_record"];
     let dir = tempfile::Builder::new().prefix("rr-legacy-").tempdir()?;
-    let socket = dir.path().join("redis.sock");
-    let redis_bin = env::var("TEST_REDIS_BIN").unwrap_or_else(|_| "redis-server".into());
-    let redis = Command::new(redis_bin)
-        .args(["--port", "0", "--unixsocket"])
-        .arg(&socket)
-        .args(["--save", "", "--appendonly", "no"])
-        .current_dir(dir.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("无法启动测试 Redis，可设置 TEST_REDIS_BIN")?;
-    let mut redis_process = ChildGuard(redis);
-    let redis_url = format!("redis+unix://{}", socket.display());
-    let database = redis::Client::open(redis_url.as_str())?;
-    let mut db = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Ok(conn) = database.get_multiplexed_async_connection().await {
-                return anyhow::Ok(conn);
-            }
-            ensure!(redis_process.0.try_wait()?.is_none(), "隔离 Redis 启动失败");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await??;
+    let (_redis, redis_url, mut db) = isolated_redis(dir.path()).await?;
     let exact = legacy["exact"].as_str().unwrap();
     let scope = legacy["scope"].as_str().unwrap();
     let key = format!("gguf-test:record:{exact}");

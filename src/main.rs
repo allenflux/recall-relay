@@ -30,6 +30,8 @@ async fn main() -> Result<()> {
 
     eprintln!("RecallRelay 已启动，监听 {addr}");
     let result = axum::serve(listener, app.router())
+        // 响应头和第一段 SSE 可能分别写入。让 TCP 立即发送小块数据，减少首字等待。
+        .tcp_nodelay(true)
         .with_graceful_shutdown(shutdown_signal())
         .await;
     app.close().await;

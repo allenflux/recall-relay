@@ -51,7 +51,7 @@ docker compose logs --tail 100 -f relay
 
 每次请求会得到一个 `request_id`。同一个 ID 下可以看到请求正文、上游主机与路径、返回状态和响应正文。JSON 直接预览，SSE 收到完整的行就输出；每个方向最多预览前 2048 字节，`omitted_bytes` 表示省略的字节数。长图片的 Base64 会缩略；图片排在提问前面时，聊天日志会另显示最多 256 字节的用户文字。二进制和压缩正文只记录长度。将 `RELAY_LOG_CONTENT=false` 写入环境文件并重建 Relay 容器，可以只看转发和降级过程。
 
-成功回答交付完毕后，`relay_cache queued=true` 表示已提交后台写入。主模型返回 503 时，`stage="primary"` 的失败行记录上游状态和原因，`relay_history` 显示历史查询结果；命中时最终响应包含 `fallback_source="history"`。
+`relay_cache queued=true` 表示后台写入队列已接收这份完整回答。队列满时，Relay 先把回答内容发给客户端，在结束 HTTP 响应前等一个写入空位。Redis 和 MySQL 随后在后台写入。新请求仍可直接发往上游。主模型返回 503 时，`stage="primary"` 的失败日志会记录上游状态和原因。命中缓存时，`relay_history` 会记录命中来源，最终响应带有 `X-Failover-Source: history`。
 
 ## 在相同地址验证故障回放
 
@@ -84,7 +84,7 @@ curl -si http://127.0.0.1:8000/v1/chat/completions \
 | 2 | [src/lib.rs](src/lib.rs) | 从 `dispatch` 读起。健康检查就地返回，启用历史的聊天请求交给聊天处理器，普通请求交给转发器。 |
 | 3 | [src/passthrough.rs](src/passthrough.rs) | 在 `forward` 里跟着一条请求看 method、原始路径、查询串、请求头和字节如何发往固定主机。 |
 | 4 | [src/relay/mod.rs](src/relay/mod.rs) | `handle` 负责解析请求，`conversation` 先请求上游，遇到可降级的故障才查缓存。 |
-| 5 | [src/history/identity.rs](src/history/identity.rs) 与 [src/history/mod.rs](src/history/mod.rs) | `canonicalize` 借用请求，生成用于查找记录的指纹。`enqueue` 把可保存的回答交给后台，`lookup` 负责故障时取回。 |
+| 5 | [src/history/identity.rs](src/history/identity.rs) 与 [src/history/mod.rs](src/history/mod.rs) | `canonicalize` 借用请求，生成用于查找记录的指纹。`enqueue_wait` 等待后台队列接收完整回答，`lookup` 负责在上游故障时取回。 |
 | 6 | [src/relay/sse.rs](src/relay/sse.rs) 与 [src/delivery.rs](src/delivery.rs) | 观察上游分块、SSE 事件和下游写入之间的区别。一个事件可能横跨多个网络分块。 |
 
 第一次读可以只走前三步。遇到 `Arc::clone`，看它包住的是哪个共享对象，例如上游连接池。Relay 发出响应头后，SSE 还可能持续输出；跟着转发任务可以看到流如何在结束、超时或断开时释放上游连接。
@@ -92,6 +92,8 @@ curl -si http://127.0.0.1:8000/v1/chat/completions \
 ## 聊天请求的处理顺序
 
 每次先请求客户端指定的主模型。历史记录按凭据和请求范围隔离，只有带单个非空 `Authorization`、可确定身份的请求才参与读写。缓存只保存通过校验的完整上游回答。
+
+后台按入队顺序写入回答，MySQL 会把已排队的多条回答合并提交。可选的向量索引在另一条队列上生成。向量计算繁忙时可能跳过索引，已经保存的完整回答仍可精确回放。
 
 上游超时、限流、服务故障或返回原因未知的错误（包括 HTTP 400、422）时，Relay 在向客户端发送回答前查询缓存。即使 HTTP 状态是 200，JSON 正文或 SSE 首个事件中出现的上游错误也按相同规则处理。遇到明确的鉴权失败、权限不足、内容政策拒绝或模型不存在时，Relay 直接转发上游响应。
 

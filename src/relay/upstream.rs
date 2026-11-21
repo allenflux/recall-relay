@@ -203,11 +203,11 @@ impl Turn {
                     return Ok(Some(finish(Body::from(body))));
                 }
                 let turn = self.clone();
-                // 生成器先交付正文，再入队。客户端提前断开会丢弃生成器。
+                // 先交付正文，再等后台接收缓存记录，最后结束响应。等待写队列不占用上游连接。
                 let output = async_stream::stream! {
                     yield Ok::<_, io::Error>(body);
                     if let (Some(identity), Some(capture)) = (&turn.identity, capture) {
-                        turn.enqueue_answer(identity, capture);
+                        turn.enqueue_answer(identity, capture).await;
                     } else {
                         turn.relay.count("ingest_invalid");
                     }
@@ -351,7 +351,7 @@ impl Turn {
             }
             if let (Some(identity), Some(captured)) = (&turn.identity, capture)
                 && let Some(body) = protocol::prepare_history(&captured, &turn.request, true, turn.reject) {
-                turn.enqueue_answer(identity, body);
+                turn.enqueue_answer(identity, body).await;
             }
         };
         // 明确错误类型，使生成器内的 ? 使用标准 I/O 错误终止流。

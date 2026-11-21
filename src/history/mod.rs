@@ -1,5 +1,5 @@
-//! 历史模块分成读、写两条路径。主模型成功时只向有界队列投递；上游故障时
-//! 才同步查 Redis、MySQL 和近似索引。没有可回放的记录时，调用方收到可重试错误。
+//! 主模型成功时，把可回放的完整回答交给有界写队列。上游故障时再查 Redis、
+//! MySQL 和近似索引。缓存写入拥堵只影响回答收尾，请求到达后仍然直接访问上游。
 
 mod embedding;
 mod hot;
@@ -21,7 +21,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
-    time::timeout,
+    time::{Instant, timeout},
 };
 use vector::{Job, Vectors};
 
@@ -35,6 +35,7 @@ pub type ReplayVerifier = Arc<
 
 type Lookup = (Option<Vec<u8>>, &'static str);
 const QUEUE: usize = 16;
+const HOT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -60,6 +61,70 @@ struct Storage {
     near_mode: Mode,
     verifier: Option<ReplayVerifier>,
     vectors: Option<Vectors>,
+}
+
+impl Storage {
+    async fn archive_answer(&self, entry: &Write) -> bool {
+        // 同步入口可能已提交给 MySQL。回填来自已有记录，只需要写 Redis。
+        if entry.archived || entry.backfill.is_some() {
+            return entry.archived;
+        }
+        let Some(db) = &self.archive else {
+            return false;
+        };
+        db.enqueue_wait(
+            &entry.identity.exact,
+            entry.identity.scope.as_deref(),
+            &entry.body,
+        )
+        .await
+    }
+
+    async fn write_hot(&self, entry: &Write, retry_hot_at: &mut Instant) -> bool {
+        let saved = matches!(timeout(IO, self.hot.put(entry)).await, Ok(Ok(())));
+        let now = Instant::now();
+        *retry_hot_at = if saved { now } else { now + HOT_RETRY_INTERVAL };
+        saved
+    }
+
+    async fn write(
+        &self,
+        entry: Write,
+        jobs: Option<&mpsc::Sender<Job>>,
+        retry_hot_at: &mut Instant,
+    ) {
+        // 正常时同时写热缓存并提交长期存储。后台按队列顺序处理下一条，
+        // 同一请求键的连续更新也会按提交顺序覆盖。
+        let (saved, archived) = if Instant::now() >= *retry_hot_at {
+            tokio::join!(
+                self.write_hot(&entry, retry_hot_at),
+                self.archive_answer(&entry)
+            )
+        } else {
+            // Redis 刚刚写失败。在下一次探测前，已有 MySQL 原件的回填可以跳过；
+            // 新回答只有被健康的 MySQL 接收后才跳过热写，避免每条都卡一次 Redis 超时。
+            if entry.backfill.is_some() {
+                return;
+            }
+            let archived = self.archive_answer(&entry).await;
+            let backed_up =
+                archived && self.archive.as_ref().is_some_and(Archive::writes_available);
+            let saved = !backed_up && self.write_hot(&entry, retry_hot_at).await;
+            (saved, archived)
+        };
+        if entry.backfill.is_some() {
+            return;
+        }
+        if !saved && !archived {
+            tracing::warn!("回答未能写入 Redis 或提交给 MySQL");
+            return;
+        }
+        if let Some(tx) = jobs
+            && let Some(job) = Job::new(entry.identity, archived)
+        {
+            let _ = tx.try_send(job);
+        }
+    }
 }
 
 struct Workers {
@@ -165,6 +230,7 @@ impl History {
         let jobs = vector_sender.clone();
         let writer = tokio::spawn(async move {
             let mut stopping = false;
+            let mut retry_hot_at = Instant::now();
             loop {
                 tokio::select! {
                     _ = &mut stopped, if !stopping => {
@@ -174,11 +240,7 @@ impl History {
                     }
                     item = receiver.recv() => {
                         let Some(entry) = item else {break};
-                        let saved = matches!(timeout(IO, store.hot.put(&entry)).await, Ok(Ok(())));
-                        if entry.backfill.is_none() && (saved || entry.archived)
-                            && let Some(tx) = &jobs && let Some(job) = Job::new(entry.identity, entry.archived) {
-                            let _ = tx.try_send(job);
-                        }
+                        store.write(entry, jobs.as_ref(), &mut retry_hot_at).await;
                     }
                 }
             }
@@ -210,7 +272,7 @@ impl History {
         budget
     }
 
-    /// try_send 在队列满时立即返回。不能为了记录历史让一个成功请求等待存储。
+    /// 供同步调用方尝试入队；如果马上不能接收，调用方可根据返回值稍后重试。
     pub fn enqueue(&self, id: &Identity, body: Vec<u8>) -> bool {
         self.queue_answer(id, body, false)
     }
@@ -220,15 +282,18 @@ impl History {
         self.queue_answer(id, body, true)
     }
 
-    fn queue_answer(&self, id: &Identity, body: Vec<u8>, verified: bool) -> bool {
-        if body.is_empty() || body.len() > MAX_RESPONSE || self.sender.is_closed() {
+    /// HTTP 请求使用这个入口。队列已满时由当前回答等待空位，不额外创建后台等待任务。
+    pub async fn enqueue_wait(&self, id: &Identity, body: Vec<u8>) -> bool {
+        let Some(entry) = self.answer_entry(id, body, false) else {
             return false;
+        };
+        self.sender.send(entry).await.is_ok()
+    }
+
+    fn answer_entry(&self, id: &Identity, body: Vec<u8>, verified: bool) -> Option<Write> {
+        if body.is_empty() || body.len() > MAX_RESPONSE || self.sender.is_closed() {
+            return None;
         }
-        let archived = self
-            .storage
-            .archive
-            .as_ref()
-            .is_some_and(|db| db.enqueue(&id.exact, id.scope.as_deref(), &body));
         let index = match id.scope.as_deref().zip(id.prompt.as_deref()) {
             Some((scope, prompt))
                 if self.storage.near_mode != Mode::Off
@@ -242,13 +307,25 @@ impl History {
             }
             _ => Index::Exact,
         };
-        let entry = Write {
+        Some(Write {
             identity: id.clone(),
             body,
             index,
-            archived,
+            archived: false,
             backfill: None,
+        })
+    }
+
+    fn queue_answer(&self, id: &Identity, body: Vec<u8>, verified: bool) -> bool {
+        let Some(mut entry) = self.answer_entry(id, body, verified) else {
+            return false;
         };
+        let archived = self
+            .storage
+            .archive
+            .as_ref()
+            .is_some_and(|db| db.enqueue(&id.exact, id.scope.as_deref(), &entry.body));
+        entry.archived = archived;
         if let Err(error) = self.sender.try_send(entry) {
             if archived
                 && let Some(tx) = &self.vector_sender
@@ -454,15 +531,13 @@ impl History {
     pub async fn close(&self) {
         if let Some(Workers {
             stop,
-            mut writer,
+            writer,
             vector_writer,
         }) = self.workers.lock().await.take()
         {
             let _ = stop.send(());
-            if timeout(IO * 2, &mut writer).await.is_err() {
-                writer.abort();
-                let _ = writer.await;
-            }
+            // 已经向 HTTP 调用方确认入队的回答优先排空，然后再让 MySQL 提交剩余批次。
+            let _ = writer.await;
             if let Some(task) = vector_writer {
                 task.abort();
                 let _ = task.await;

@@ -326,8 +326,8 @@ struct Turn {
 
 impl Turn {
     /// 正文成功交付后才入队。后台写入稍后执行，日志只记录队列是否接收了这份回答。
-    fn enqueue_answer(&self, identity: &Identity, body: Vec<u8>) {
-        let queued = self.relay.history.enqueue(identity, body);
+    async fn enqueue_answer(&self, identity: &Identity, body: Vec<u8>) {
+        let queued = self.relay.history.enqueue_wait(identity, body).await;
         tracing::info!(parent: &self.span, queued, streaming = self.streaming, "relay_cache");
     }
 }
