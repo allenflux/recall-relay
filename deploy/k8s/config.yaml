@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: recall-relay-config
+data:
+  RELAY_BIND: "0.0.0.0:8000"
+  INGRESS_ORIGIN: "http://recall-relay:8000"
+  UPSTREAM_URL: "https://open-sealion.aiaigirl.com/v1/chat/completions"
+  REQUEST_PATH: "/v1/chat/completions"
+  POLICY_EPOCH: "history-v1"
+  REDIS_PREFIX: "recall-relay:v1"
+  HISTORY_NEAR_MODE: "replay"
+  HISTORY_EMBEDDING_MODE: "off"
+  HISTORY_EMBEDDING_MODEL: "embeddinggemma:300m-qat-q8_0"
+  HISTORY_EMBEDDING_URL: "http://127.0.0.1:11434/api/embed"
+  HISTORY_EMBEDDING_THRESHOLD: "0.90"
+  HISTORY_EMBEDDING_LAST_RESORT_THRESHOLD: ""
+  HISTORY_EMBEDDING_TIMEOUT_SECONDS: "0.65"
+  MYSQL_HOST: "recall-relay-mysql"
+  MYSQL_PORT: "3306"
+  MYSQL_USER: "recall_relay"
+  MYSQL_DATABASE: "recall_relay"
+  FALLBACK_MODEL: "gemma4-31b-heretic"
+  FALLBACK_MODEL_MULTIMODAL: "true"
+  FALLBACK_MODEL_TIMEOUT_SECONDS: "12"
+  CPU_FALLBACK_ENABLED: "true"
+  CPU_FALLBACK_URL: "http://127.0.0.1:11434/v1/chat/completions"
+  CPU_FALLBACK_MODEL: "recall-relay-cpu:vision"
+  CPU_FALLBACK_MULTIMODAL: "true"
+  CPU_FALLBACK_TIMEOUT_SECONDS: "18"
+  CPU_FALLBACK_MAX_INFLIGHT: "1"
+  TOTAL_TIMEOUT_SECONDS: "60"
+  STREAM_TIMEOUT_SECONDS: "600"
+  UPSTREAM_TIMEOUT_SECONDS: "55"
+  MAX_INFLIGHT: "16"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: recall-relay-ollama
+data:
+  Modelfile: |
+    FROM hf.co/ggml-org/SmolVLM-256M-Instruct-GGUF:Q8_0
+    PARAMETER num_gpu 0
+    PARAMETER num_ctx 2048
+  prepare-model.sh: |
+    #!/bin/sh
+    set -eu
+    model_file=${OLLAMA_MODELFILE:-/etc/recall-relay/ollama/Modelfile}
+    alias=recall-relay-cpu:vision
+    embedding_enabled=false
+    if [ "$HISTORY_NEAR_MODE" != off ] && [ "$HISTORY_EMBEDDING_MODE" != off ]; then
+      embedding_enabled=true
+    fi
+    if [ "$CPU_FALLBACK_ENABLED" = false ] && [ "$embedding_enabled" = false ]; then
+      exit 0
+    fi
+
+    ollama serve &
+    server_pid=$!
+    cleanup() {
+      kill "$server_pid" 2>/dev/null || true
+      wait "$server_pid" 2>/dev/null || true
+    }
+    trap cleanup EXIT
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
+
+    attempts=0
+    until ollama list >/dev/null 2>&1; do
+      attempts=$((attempts + 1))
+      if ! kill -0 "$server_pid" 2>/dev/null || [ "$attempts" -ge 30 ]; then
+        echo 'Ollama did not start for model initialization' >&2
+        exit 1
+      fi
+      sleep 1
+    done
+    if [ "$CPU_FALLBACK_ENABLED" = true ]; then
+      read -r directive base_model < "$model_file"
+      if [ "$directive" != FROM ] || [ -z "$base_model" ]; then
+        echo 'Modelfile must start with a FROM directive' >&2
+        exit 1
+      fi
+      if ! ollama show "$base_model" >/dev/null 2>&1; then
+        ollama pull "$base_model"
+      fi
+      ollama create "$alias" -f "$model_file"
+      ollama show "$alias" >/dev/null
+    fi
+
+    if [ "$embedding_enabled" = true ]; then
+      if ! ollama show "$HISTORY_EMBEDDING_MODEL" >/dev/null 2>&1 && ! timeout 120 ollama pull "$HISTORY_EMBEDDING_MODEL"; then
+        echo 'Embedding model preparation failed. Continuing without embeddings.' >&2
+      fi
+    fi

@@ -1,0 +1,24 @@
+services:
+  relay:
+    environment:
+      UPSTREAM_URL: http://mock-upstream:8091/v1/chat/completions
+    depends_on:
+      mock-upstream:
+        condition: service_healthy
+
+  mock-upstream:
+    build:
+      context: .
+      target: mock-upstream
+    restart: unless-stopped
+    environment:
+      MOCK_UPSTREAM_API_KEY: ${MOCK_UPSTREAM_API_KEY:?set MOCK_UPSTREAM_API_KEY in .env.compose.mock}
+      MOCK_FALLBACK_MODEL: ${FALLBACK_MODEL:-gemma4-31b-heretic}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "2", "http://127.0.0.1:8091/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
