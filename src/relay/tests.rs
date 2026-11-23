@@ -122,3 +122,72 @@ async fn unpolled_downstream_drops_the_upstream_response_at_deadline() {
         .expect_err("上游响应只在析构时关闭通知通道");
     assert!(to_bytes(response.into_body(), 1024).await.is_err());
 }
+
+#[tokio::test]
+async fn reading_done_from_upstream_does_not_confirm_delivery() {
+    let state = Arc::new(delivery::SseCacheTail::default());
+    let upstream_state = state.clone();
+    let (parsed, ready) = tokio::sync::oneshot::channel();
+    let (resumed, drained) = tokio::sync::oneshot::channel();
+    let upstream = async_stream::stream! {
+        upstream_state.set_candidate(true);
+        let _ = parsed.send(());
+        yield Ok::<_, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n"));
+        let _ = resumed.send(());
+    };
+    let mut response = Response::new(Body::from_stream(upstream));
+    response.extensions_mut().insert(state);
+    let response = delivery::bounded(response, Instant::now() + Duration::from_secs(10));
+
+    // 上游已解析终帧，下游连这一帧都没取就断开。此时须释放上游，不能进入排尾阶段。
+    ready.await.unwrap();
+    drop(response);
+    assert!(
+        timeout(Duration::from_secs(1), drained)
+            .await
+            .unwrap()
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn delivered_done_with_a_stalled_tail_releases_the_upstream() {
+    let state = Arc::new(delivery::SseCacheTail::default());
+    let upstream_state = state.clone();
+    let (resumed, draining) = tokio::sync::oneshot::channel();
+    let (guard, dropped) = tokio::sync::oneshot::channel::<()>();
+    let upstream = async_stream::stream! {
+        let _guard = guard;
+        upstream_state.set_candidate(true);
+        yield Ok::<_, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n"));
+        let _ = resumed.send(());
+        std::future::pending::<()>().await;
+    };
+    let mut response = Response::new(Body::from_stream(upstream));
+    let wall = Instant::now() + Duration::from_secs(10);
+    response.extensions_mut().insert(delivery::Limits {
+        wall,
+        idle: Some(Duration::from_millis(50)),
+    });
+    response.extensions_mut().insert(state);
+    let mut chunks = delivery::bounded(response, wall)
+        .into_body()
+        .into_data_stream();
+
+    // 客户端取走终帧后直接关闭。上游没有发 HTTP EOF，排尾应在短时限内自行结束。
+    assert_eq!(
+        chunks.next().await.unwrap().unwrap().as_ref(),
+        b"data: [DONE]\n\n"
+    );
+    drop(chunks);
+    timeout(Duration::from_secs(1), draining)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        timeout(Duration::from_secs(1), dropped)
+            .await
+            .unwrap()
+            .is_err()
+    );
+}

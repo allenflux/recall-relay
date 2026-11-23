@@ -251,6 +251,11 @@ impl Completion {
                 || !self.done
                 || !self.buffer.trim_ascii().is_empty())
     }
+
+    /// 用于判断是否值得在下游关闭后读取尾部。能否回放仍由 EOF 后的 history_text 严格校验。
+    pub fn saw_completion(&self) -> bool {
+        self.known && self.finished && self.done && !self.invalid && !self.opaque
+    }
 }
 
 pub(super) fn history_text(raw: &[u8]) -> Option<(String, Vec<u8>)> {

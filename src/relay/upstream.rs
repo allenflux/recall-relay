@@ -224,10 +224,21 @@ impl Turn {
                 },
                 idle: is_sse.then_some(allowance),
             };
-            let output =
-                self.streaming_body(upstream, first, limits, is_sse && opening_error.is_none());
+            let check_completion = is_sse && opening_error.is_none();
+            let cache_tail = (self.identity.is_some() && check_completion)
+                .then(|| Arc::new(crate::delivery::SseCacheTail::default()));
+            let output = self.streaming_body(
+                upstream,
+                first,
+                limits,
+                check_completion,
+                cache_tail.clone(),
+            );
             let mut response = finish(output);
             response.extensions_mut().insert(limits);
+            if let Some(tail) = cache_tail {
+                response.extensions_mut().insert(tail);
+            }
             if let Some(fault) = opening_error {
                 // 保留首个事件和其余流。若查到历史，丢弃这个响应也会关闭对原上游的读取。
                 upstream_error = Some(response);
@@ -305,9 +316,9 @@ impl Turn {
         first: Vec<Bytes>,
         limits: crate::delivery::Limits,
         check_completion: bool,
+        cache_tail: Option<Arc<crate::delivery::SseCacheTail>>,
     ) -> Body {
         let turn = self.clone();
-        let can_store = self.identity.is_some() && check_completion;
         let next_cutoff = move || {
             limits
                 .idle
@@ -316,7 +327,7 @@ impl Turn {
         let mut cutoff = next_cutoff();
         let stream = async_stream::try_stream! {
             let mut tracker = sse::Completion::default();
-            let mut capture = can_store.then(Vec::new);
+            let mut capture = cache_tail.as_ref().map(|_| Vec::new());
             let mut initial = first.into_iter();
             loop {
                 let next = if let Some(first) = initial.next() {
@@ -342,6 +353,9 @@ impl Turn {
                         // 超出缓存上限后仍照常转发，不再积累历史副本。
                         capture = None;
                     }
+                }
+                if let Some(tail) = &cache_tail {
+                    tail.set_candidate(capture.is_some() && tracker.saw_completion());
                 }
                 // yield 会把控制权交回 HTTP 层；下游准备好之前不会拉取下一块上游数据。
                 yield chunk;

@@ -553,6 +553,135 @@ async fn isolated_redis(
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "需要本机 redis-server"]
+async fn sse_disconnect_only_caches_a_delivered_done_with_a_valid_tail() -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+
+    const STOP: &str = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"完整回答\"},\"finish_reason\":\"stop\"}]}\n\n";
+    const DONE: &str = "data: [DONE]\n\n";
+    const CASES: [&str; 4] = ["clean", "error-tail", "partial-tail", "before-done"];
+    let (release, tail) = tokio::sync::watch::channel(false);
+    let upstream = serve(Router::new().fallback(move |headers: axum::http::HeaderMap| {
+        let mut tail = tail.clone();
+        async move {
+            let mode = headers["x-request-id"].to_str().unwrap().to_owned();
+            if mode == "outage" {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            let stream = async_stream::stream! {
+                yield Ok::<_, std::io::Error>(Bytes::from_static(STOP.as_bytes()));
+                if mode != "before-done" {
+                    yield Ok(Bytes::from_static(DONE.as_bytes()));
+                }
+                // 由测试放行上游最后的字节和 HTTP EOF，让客户断开和上游结束有确定的先后顺序。
+                if tail.wait_for(|&released| released).await.is_err() {
+                    return;
+                }
+                match mode.as_str() {
+                    "before-done" => yield Ok(Bytes::from_static(DONE.as_bytes())),
+                    "error-tail" => yield Ok(Bytes::from_static(b"event: error\ndata: failed\n\n")),
+                    "partial-tail" => yield Ok(Bytes::from_static(b"data: {")),
+                    "clean" => {}
+                    _ => unreachable!(),
+                }
+            };
+            ([(header::CONTENT_TYPE, "text/event-stream")], Body::from_stream(stream)).into_response()
+        }
+    })).await;
+    let dir = tempfile::tempdir()?;
+    let (_redis, redis_url, _db) = isolated_redis(dir.path()).await?;
+    let log = tempfile::NamedTempFile::new()?;
+    let (_relay, addr) = start_relay_with_stdout(
+        &[
+            (
+                "UPSTREAM_URL",
+                &format!("http://{upstream}/v1/chat/completions"),
+            ),
+            ("REDIS_URL", &redis_url),
+            ("HISTORY_NEAR_MODE", "off"),
+            ("RELAY_LOG_CONTENT", "false"),
+        ],
+        log.reopen()?.into(),
+    );
+    let client = client();
+    let request = |prompt: &str, mode: &str| {
+        client
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .bearer_auth("test")
+            .header("x-request-id", mode)
+            .json(
+                &json!({"model":"sse","stream":true,"messages":[{"role":"user","content":prompt}]}),
+            )
+    };
+    let complete = format!("{STOP}{DONE}");
+    for case in CASES {
+        let expected = if case == "before-done" {
+            STOP
+        } else {
+            &complete
+        };
+        let mut res = request(case, case).send().await?;
+        ensure!(res.status() == 200, "{case}");
+        let mut received = Vec::new();
+        while received.len() < expected.len() {
+            received.extend_from_slice(&res.chunk().await?.context("上游过早结束")?);
+        }
+        ensure!(received == expected.as_bytes(), "{case}");
+        // 已收到终止标记的客户端也可以直接关闭，不需要再读一次网络数据。
+        drop(res);
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let logs = std::fs::read_to_string(log.path())?;
+            let closed = logs
+                .lines()
+                .filter(|l| l.contains("正文结束") && l.contains("direction=\"响应\""))
+                .count();
+            if closed == CASES.len() {
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("Relay 未观察到全部客户端关闭")??;
+    // 即使已经收到 [DONE]，上游仍可能发送错误尾帧；此时四条请求都不应已有记录。
+    for case in CASES {
+        ensure!(
+            request(case, "outage").send().await?.status() == 503,
+            "{case} 过早入库"
+        );
+    }
+    release.send(true)?;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let res = request("clean", "outage").send().await?;
+            if res.status() == 200 {
+                ensure!(
+                    res.headers()
+                        .get("x-failover-source")
+                        .is_some_and(|v| v == "history")
+                );
+                ensure!(res.text().await? == complete);
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("收到完整 SSE 的客户端断开后，正常回答未能回放")??;
+    for case in ["before-done", "error-tail", "partial-tail"] {
+        let res = request(case, "outage").send().await?;
+        ensure!(
+            res.status() == 503 && !res.headers().contains_key("x-failover-source"),
+            "{case} 意外回放"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "需要本机 redis-server"]
 async fn burst_replays_every_completed_json_and_sse_answer() -> anyhow::Result<()> {
     use futures_util::{StreamExt, stream};
 
